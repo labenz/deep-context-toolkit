@@ -1,0 +1,243 @@
+# Deep Context Toolkit
+
+A personal knowledge base system that extracts your communications from Gmail, Slack, Beeper (iMessage/WhatsApp/Signal), GroupMe, Twitter/X, and Fireflies call transcripts into a unified SQLite database. AI enrichment adds metadata (topics, sentiment, quality scores) to every message, and synthesis commands generate relationship summaries, timelines, and project overviews.
+
+The goal: give your AI assistant deep, searchable context about your professional and personal communications.
+
+On top of the raw knowledge base, an optional **wiki layer** turns the data into monthly narrative briefings and a browsable, two-repo (shared/private) knowledge wiki — see [WIKI.md](WIKI.md).
+
+## Architecture
+
+The system follows a three-stage pipeline:
+
+1. **Extract** -- Pull messages from each source into a normalized schema (threads + messages + people)
+2. **Enrich** -- AI metadata generation (via Gemini) scores each of your messages for quality, originality, topics, sentiment, and more
+3. **Synthesize** -- Higher-level summaries: relationship profiles, project timelines, communication preferences, thinking patterns
+
+All data lives in a single SQLite database with WAL mode for concurrent reads.
+
+## Sources
+
+| Source | What it captures | Auth method |
+|--------|-----------------|-------------|
+| **Gmail** | Email you sent **plus inbound mail from known contacts** | Google OAuth (gmail.readonly) |
+| **Slack** | Your messages, threads you're @-mentioned in, and full-capture channels — across workspaces, including DMs | Slack Bot Token per workspace |
+| **Beeper** | iMessage, WhatsApp, Signal conversations | Beeper Desktop API token |
+| **GroupMe** | Group and DM messages | GroupMe access token (no app) |
+| **Twitter/X** | Your tweets, replies, quote tweets, threads | Archive import (no creds) + official X API v2 (live) |
+| **Calls** | Meeting transcripts from Fireflies.ai | Fireflies API key |
+
+Each source supports incremental extraction -- after the first full run, subsequent extractions only fetch new content.
+
+### Inbound coverage (capturing what comes *to* you)
+
+Early versions captured mostly your *outbound* messages. The system now also captures credible *inbound* communication, so threads from people who matter aren't lost just because you didn't reply:
+
+- **Gmail** runs two passes: your sent mail (`from:me`) **and** inbound mail *from contacts you've corresponded with* (derived automatically from your existing threads).
+- **Slack** runs three passes: your messages, threads where you're **@-mentioned** but haven't replied, and **full capture** of any channels you list in `tools/slack-capture-config.json` (copy `slack-capture-config.template.json` to enable).
+
+## Quick Start
+
+1. Clone or unzip this folder
+2. Install Bun: `curl -fsSL https://bun.sh/install | bash`
+3. Install dependencies: `cd tools && bun install`
+4. Open Claude Code in this directory and say:
+
+```
+"I just set up the deep-context toolkit. Help me configure it for my
+accounts. I need to: (1) set up Google OAuth for Gmail access, (2) connect
+my Slack workspaces, (3) optionally set up Beeper, Twitter, and Fireflies.
+Walk me through each one. Start by reading the README.md and
+.env.example, then guide me through setup interactively."
+```
+
+## Prerequisites
+
+- **Bun** (TypeScript runtime) -- `curl -fsSL https://bun.sh/install | bash`
+- **Google Cloud OAuth credentials** -- for Gmail access (gmail.readonly scope, device auth flow)
+- **Slack Bot Token(s)** -- one per workspace, with channels:history, channels:read, search:read, users:read scopes
+- **Beeper Desktop** (optional) -- with Developer API enabled for iMessage/WhatsApp/Signal
+- **GroupMe access token** (optional) -- create an app at dev.groupme.com; token-only, no desktop app
+- **Twitter/X** (optional) -- archive import (download from x.com/settings, no credentials needed) and/or live fetch via the official X API v2 (create an app at developer.x.com, set the `X_API_*` keys)
+- **Fireflies API key** (optional) -- requires Business plan for transcript access
+- **Gemini API key** -- for enrichment (gemini-3-flash) and synthesis
+- **Anthropic API key** (optional) -- for the wiki layer (summaries + article generation) and LLM contact matching
+- **macOS recommended** -- Beeper Desktop and macOS Contacts integration are macOS-native
+
+## File Structure
+
+```
+deep-context-toolkit/
+  tools/
+    deep-context.ts          # Main CLI -- all commands run through here (GroupMe extraction lives here too)
+    gmail-extractor.ts       # Gmail extraction logic (outbound + inbound-from-known passes)
+    slack.ts                 # Slack API client
+    twitter-api.ts           # Twitter/X official API v2 client (live tweet fetch)
+    beeper.ts                # Beeper Desktop API client
+    calls.ts                 # Call transcript management (Fireflies)
+    contacts.ts              # macOS Contacts integration
+    calls.ts                 # Call transcript management
+    fireflies.ts             # Fireflies.ai API client (used by calls.ts)
+    deepgram.ts              # Deepgram API client (audio re-transcription, optional)
+    gemini.ts / anthropic.ts / openai.ts   # LLM provider clients (enrichment, synthesis, summaries)
+    summarize.ts             # Multi-model summarization engine (wiki layer)
+    slack-capture-config.template.json  # Full-capture channel list (copy to enable)
+    package.json             # Dependencies
+    _lib/                    # Shared utilities (env, oauth, http, contact matching, ...)
+  data/
+    deep_context/
+      schema.sql             # Database schema (auto-applied on init)
+      validation_queries.sql # Diagnostic queries
+      config.template.json   # Configuration template
+      beeper-config.template.json  # Beeper privacy filter template
+      deep_context.db        # SQLite database (created on first run)
+      summaries/             # Monthly/annual summary pipeline (wiki layer)
+        prompts/             # Generic summary prompt templates
+        build-prompt.sh      # Assembles a month's prompt with rolling context
+      wiki-generation/       # corrections.json, contact-lookup.json (generation assets)
+      wiki-private/          # PRIVATE wiki (source of truth; never published)
+  wiki/                      # SHARED wiki repo starter (publishable; host on a private GitHub repo)
+    _build_index.ts          # Rebuilds backlinks / entity registry / index pages
+  skills/
+    update-deep-context/     # Keep the knowledge base fresh (extract + enrich)
+    summarize-monthly/       # Generate monthly narrative briefings
+    wiki/                    # Build & maintain the knowledge wiki
+  WIKI.md                    # The wiki layer: architecture + setup guide
+```
+
+## Key Commands
+
+All commands use: `bun tools/deep-context.ts <command>`
+
+```bash
+# First-time setup
+deep-context init                    # Create database and directory structure
+
+# Status
+deep-context status                  # Show extraction status, counts, staleness
+
+# Extraction
+deep-context extract gmail           # Extract Gmail (outbound + inbound-from-known passes)
+deep-context extract slack           # Extract Slack (your msgs + mentions + full-capture channels)
+deep-context extract slack-dm        # Extract Slack DMs
+deep-context extract beeper          # Extract Beeper messages
+deep-context extract groupme         # Extract GroupMe (use --backfill on first run)
+deep-context extract twitter         # Import Twitter archive + live fetch
+deep-context extract calls           # Extract call transcripts
+
+# Enrichment
+deep-context enrich --limit 200      # AI-enrich up to 200 unprocessed messages
+
+# Search
+deep-context query "search term"     # Full-text search across all sources
+deep-context query "term" --source gmail --limit 20
+deep-context recent --hours 24       # Browse recent threads without a search term
+
+# Synthesis
+deep-context synthesize timeline --from 2025-01-01 --to 2025-12-31
+deep-context synthesize relationships --person jane-doe
+deep-context synthesize projects
+deep-context synthesize preferences
+deep-context synthesize thinking
+
+# Export
+deep-context export people --output people.json
+deep-context extract-for-summary --from 2025-01-01 --to 2025-06-30
+
+# Todo tracking (auto-detected from messages)
+deep-context todo list               # View detected action items
+deep-context todo recap --since 24   # Last 24 hours of action items
+deep-context todo strategic          # Birds-eye organizational analysis
+
+# Contact unification
+deep-context contacts status         # Show dedup progress
+deep-context contacts suggest        # Find potential duplicate contacts
+deep-context contacts review         # Interactive review of suggestions
+```
+
+## Configuration
+
+### config.json
+
+Copy `data/deep_context/config.template.json` to `data/deep_context/config.json` and customize:
+
+- **privacy** -- emails, phone patterns, and names to exclude globally
+- **extraction** -- per-source settings (Slack workspaces, Twitter archive path, etc.)
+- **enrichment** -- AI model and batch size for metadata generation
+- **synthesis** -- AI model for higher-level summaries
+
+### beeper-config.json
+
+Copy `data/deep_context/beeper-config.template.json` to `data/deep_context/beeper-config.json` to configure:
+
+- Contacts to exclude from extraction
+- Which messaging services to enable/disable (iMessage, WhatsApp, Signal, etc.)
+
+### .env
+
+Create `tools/.env` with your API keys and tokens. Required variables depend on which sources you use:
+
+```bash
+# Google OAuth (required for Gmail)
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+GOOGLE_TOKEN=
+GOOGLE_REFRESH_TOKEN=
+
+# Slack (one token per workspace)
+SLACK_BOT_TOKEN_MYWORKSPACE=xoxb-...
+
+# Gemini (required for enrichment/synthesis)
+GEMINI_API_KEY=
+
+# Beeper (optional)
+BEEPER_ACCESS_TOKEN=
+
+# GroupMe (optional -- token from dev.groupme.com)
+GROUPME_ACCESS_TOKEN=
+
+# Twitter / X (optional -- official X API v2; archive import needs no creds)
+X_API_CONSUMER_KEY=
+X_API_CONSUMER_SECRET=
+X_API_ACCESS_TOKEN=
+X_API_ACCESS_TOKEN_SECRET=
+X_API_BEARER_TOKEN=
+
+# Fireflies (optional)
+FIREFLIES_API_KEY=
+
+# Anthropic (optional -- wiki layer summaries + article generation, LLM contact matching)
+ANTHROPIC_API_KEY=
+```
+
+### OWNER_CONFIG
+
+In `tools/deep-context.ts`, the `OWNER_CONFIG` block at the top of the file must be filled in with your identity information (name, emails, Twitter handle, Slack user IDs + per-workspace search/mention queries). This is how the system knows which messages are yours vs. other participants'. The `gmail-extractor.ts` imports this same block.
+
+## The Wiki Layer (optional, but the most valuable part)
+
+The raw database is great for search. The **wiki layer** turns it into durable, readable knowledge:
+
+```
+deep-context DB  →  extract-for-summary  →  /summarize-monthly  →  /wiki update  →  wiki articles
+```
+
+1. **Monthly summaries** — `summarize-monthly` compresses each month of activity into a dense, 15-20K-word narrative briefing with hundreds of precise retrieval pointers back to the source messages.
+2. **The wiki** — `wiki` absorbs those summaries into a browsable set of articles (people, organizations, projects, positions, expertise, timeline) across **two repos**: a **shared** wiki (`wiki/`, safe for agents/an assistant to read) and a **private** wiki (`data/deep_context/wiki-private/`, the full-detail source of truth that's never published). The shared article is always *derived* from the private one by stripping sensitive content.
+
+This is what lets an AI assistant get rich context about you without ever touching your raw inbox. See **[WIKI.md](WIKI.md)** for the full architecture and first-time setup, and the `summarize-monthly` and `wiki` skills for the commands.
+
+## Database
+
+The SQLite database is auto-created at `data/deep_context/deep_context.db` when you run `deep-context init`. The schema is defined in `data/deep_context/schema.sql`.
+
+Key tables:
+- **threads** -- Conversation containers (email threads, chat conversations, tweet threads, calls)
+- **messages** -- Individual messages within threads
+- **people** -- Contacts extracted from communications
+- **message_metadata** -- AI-generated enrichment (quality, topics, sentiment, etc.)
+- **syntheses** -- Generated summaries (timelines, relationship profiles, etc.)
+- **todo_items** -- Action items auto-detected from messages
+- **unified_contacts** -- Deduplicated contact records
+
+The database uses WAL mode for concurrent read access. Close other database viewers before running extractions to avoid write contention.

@@ -1,0 +1,13 @@
+{
+  "_comment": "Full-capture config for deep-context Slack extraction. Edit by hand. Channels/users listed here get ALL messages captured (not just your own participation) — useful for channels you follow but rarely post in. Leave the arrays empty to capture nothing extra; `extract slack` still runs the from: (your messages) and mentions passes regardless. Run a specific pass with `extract slack-channel-full` / `extract slack-user-full`.",
+  "full_capture_channels": [
+    {
+      "_example": "Remove this example and add your own. workspace must match a key in OWNER_CONFIG.slackIdentifiers; channel_id is the Slack channel ID (Cxxxxxxxx).",
+      "workspace": "myworkspace",
+      "channel_id": "C00000000",
+      "channel_name": "example-channel",
+      "backfill_from": "2023-01-01"
+    }
+  ],
+  "full_capture_users": []
+}

@@ -1,0 +1,63 @@
+{
+  "_comment": "Deep Context Toolkit configuration. Copy to config.json and customize.",
+  "version": 1,
+
+  "privacy": {
+    "_comment": "Global privacy filters applied across all extraction sources.",
+    "excluded_emails": [],
+    "excluded_phone_patterns": [],
+    "excluded_names": []
+  },
+
+  "extraction": {
+    "_comment": "Per-source extraction settings. Disable sources you don't use by removing them or setting enabled: false.",
+
+    "gmail": {
+      "_comment": "Gmail extraction via Google OAuth. Requires gmail.readonly scope.",
+      "newer_than_years": 5,
+      "early_termination_threshold": 200
+    },
+
+    "slack": {
+      "_comment": "Slack workspace extraction. workspaces matches keys in OWNER_CONFIG.slackIdentifiers / SLACK_BOT_TOKEN_<NAME> env vars. `extract slack` runs three passes: your messages (from:), threads where you're @-mentioned, and any full-capture channels in tools/slack-capture-config.json.",
+      "workspaces": []
+    },
+
+    "beeper": {
+      "_comment": "Beeper (unified messaging) extraction. Requires Beeper Desktop API enabled.",
+      "skip_twitter": true
+    },
+
+    "groupme": {
+      "_comment": "GroupMe extraction via REST API (token-only, no app). Requires GROUPME_ACCESS_TOKEN. First run should use `extract groupme --backfill` for full history, then it goes incremental.",
+      "enabled": false
+    },
+
+    "twitter": {
+      "_comment": "Twitter/X archive import. Download your archive from x.com/settings and set archive_path to the extracted directory.",
+      "archive_path": ""
+    },
+
+    "calls": {
+      "_comment": "Call/meeting transcript extraction (e.g., from Fireflies.ai).",
+      "enabled": true
+    },
+
+    "podcast": {
+      "_comment": "Podcast transcript extraction. Set enabled: true and provide path to an episodes CSV if you have a podcast.",
+      "enabled": false,
+      "episodes_csv": ""
+    }
+  },
+
+  "enrichment": {
+    "_comment": "AI-powered enrichment of extracted threads. Model should support large context and structured output. All schema fields must be marked required (Gemini silently drops optional fields).",
+    "model": "gemini-3-flash",
+    "batch_size": 50
+  },
+
+  "synthesis": {
+    "_comment": "Higher-quality model for summary synthesis and strategic analysis. Any current Gemini model works; use a 'pro' tier for best quality. These are just defaults — override per your access.",
+    "model": "gemini-2.5-pro"
+  }
+}

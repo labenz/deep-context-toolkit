@@ -1,0 +1,26 @@
+{
+  "_comment": "Privacy filtering for Beeper message extraction. Copy to beeper-config.json and customize. Add contacts or chat patterns to exclude from extraction.",
+
+  "excluded_contacts": [
+    {
+      "_example": "Add display names of contacts whose conversations should be fully excluded.",
+      "name": "Example Contact",
+      "mode": "entire_chat"
+    }
+  ],
+
+  "service_config": {
+    "_comment": "Enable or disable extraction per messaging service. Only enabled services will be scanned.",
+    "imessage": { "enabled": true },
+    "whatsapp": { "enabled": true },
+    "signal": { "enabled": true },
+    "twitter": { "enabled": false, "_comment": "Usually skip - Twitter data extracted separately via archive/API" },
+    "facebook": { "enabled": false },
+    "linkedin": { "enabled": false }
+  },
+
+  "signal_whitelist": {
+    "_comment": "If non-empty, only these Signal chat IDs will be extracted. Leave as empty array to extract all Signal chats.",
+    "chat_ids": []
+  }
+}

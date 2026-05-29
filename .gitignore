@@ -1,0 +1,30 @@
+# Secrets
+.env
+tools/.env
+
+# Databases (each user creates their own)
+data/deep_context/deep_context.db
+data/deep_context/deep_context.db-shm
+data/deep_context/deep_context.db-wal
+data/contacts.db
+
+# Config files (created from templates)
+data/deep_context/config.json
+data/deep_context/beeper-config.json
+tools/slack-capture-config.json
+
+# Your generated data — keep private, never commit
+data/deep_context/summaries/monthly-exports/*.md
+data/deep_context/summaries/monthly-summaries/*.md
+data/deep_context/summaries/annual-summaries/*.md
+data/deep_context/summaries/prompts/prompt-*.md
+data/deep_context/wiki-private/*/*.md
+
+# Dependencies
+node_modules/
+tools/node_modules/
+
+# System
+.DS_Store
+*.swp
+*~
