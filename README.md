@@ -16,6 +16,23 @@ The system follows a three-stage pipeline:
 
 All data lives in a single SQLite database with WAL mode for concurrent reads.
 
+## How your agent uses this (the access model)
+
+There's **no MCP server** here, and you don't need one. An AI agent reaches the data through three plain mechanisms — and the distinction that makes the whole thing work is **search vs. standing context**:
+
+1. **The CLI is the search layer.** The agent shells out to `deep-context.ts` over Bash — `deep-context query "term" --source gmail --limit 20`, `deep-context recent --hours 24`, `deep-context synthesize relationships --person jane-doe`. It's a thin, composable wrapper over the SQLite DB so the agent writes commands instead of hand-rolling SQL, and the good default joins/ranking live in one place. You *could* point an agent straight at the raw `.db`, but the CLI keeps queries consistent and stops the agent from rediscovering the schema every session.
+
+2. **`CLAUDE.md` + the skills teach the agent the system exists.** This is the part people skip: the access mechanism isn't the database — it's *telling the agent the database exists and how you want it queried*. The repo's [`CLAUDE.md`](CLAUDE.md) documents the command vocabulary and auto-loads as project instructions; the `skills/` (`update-deep-context`, `summarize-monthly`, `wiki`) auto-discover and encode the multi-step procedures. That's the entire "integration."
+
+3. **The wiki is the standing-context layer — plain markdown the agent reads directly.** The DB is for *retrieval when you need it*. The highest-value context is the stuff you want the agent to **already know** without querying: who the people in your life are, what your projects are, your positions and history. That's the wiki — a browsable set of articles generated *from* the DB (see [WIKI.md](WIKI.md)). The agent just reads those files. No query, no MCP, just markdown on disk:
+
+   ```
+   DB  →  monthly summary  →  wiki articles the agent reads as plain files
+   (search layer)               (standing-context layer)
+   ```
+
+The payoff is the combination: the wiki gives the agent broad, durable context about your world, and the CLI lets it drill back down to the exact original message when it needs a specific fact or quote. The two-repo split in the wiki layer (a private source-of-truth tree and a *derived* shared tree with the sensitive material stripped) is what lets you hand an autonomous agent — or a trusted assistant — useful context without ever exposing the raw inbox.
+
 ## Sources
 
 | Source | What it captures | Auth method |
