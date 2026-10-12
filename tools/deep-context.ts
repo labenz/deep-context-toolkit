@@ -7613,7 +7613,7 @@ function stripEmailQuotes(content: string): string {
     ''
   ).trim()
 
-  // Also handle Shortwave/Yahoo format: "On Mon Jan 26, 2026, 05:37 PM GMT, Steve Newman wrote:"
+  // Also handle Shortwave/Yahoo format: "On Mon Jan 5, 2026, 05:37 PM GMT, Jane Doe wrote:"
   cleaned = cleaned.replace(
     /\n\n\s*On\s+\w+\s+\w+\s+\d{1,2},\s+\d{4},?\s+\d{1,2}:\d{2}\s*(?:AM|PM|GMT|UTC)?[\s\S]+?wrote:\s*\n[\s\S]*$/i,
     ''
@@ -7714,9 +7714,7 @@ async function extractGmailSection(db: Database, config: ExtractConfig): Promise
         }
 
         // Fallback: subject pattern matching for known automated reports
-        if (/^Daily Conference Prospects/i.test(subject) ||
-            /^📝.*Guest Prep/i.test(subject) ||
-            /^Weekly.*Summary/i.test(subject)) {
+        if (/^Weekly.*Summary/i.test(subject)) {
           automatedIds.add(msg.id)
         }
       }
@@ -8161,8 +8159,8 @@ async function extractCallsSection(db: Database, config: ExtractConfig): Promise
     const date = formatDateOnly(thread.started_at)
 
     // Extract fireflies ID from thread id to find summary file
-    // Thread IDs are like "calls:01KFEQ7EFHJYWGDFXR61NEPF0G"
-    // Summary files are like "2026-01-21_Guest Name and Owner Name_01KFEQ7E.md"
+    // Thread IDs are like "calls:01JAAAAAAAAAAAAAAAAAAAAAAA"
+    // Summary files are like "2026-01-01_Guest Name and Owner Name_01JAAAAA.md"
     // The summary file uses a truncated ID (first 8 chars)
     const fullId = thread.id.replace('calls:', '')
     const shortId = fullId.substring(0, 8)

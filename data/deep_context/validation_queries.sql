@@ -51,7 +51,7 @@ GROUP BY source;
 SELECT position_in_thread, is_from_me, content_type,
        substr(content, 1, 80) as content_preview
 FROM messages
-WHERE thread_id = 'twitter:2011625830003142723'
+WHERE thread_id = 'twitter:1234567890123456789'  -- Change this
 ORDER BY position_in_thread;
 
 -- 5. Find largest multi-tweet threads
@@ -161,7 +161,7 @@ SELECT
     substr(m.content, 1, 100) as speech
 FROM messages m
 LEFT JOIN people p ON m.sender_id = p.id
-WHERE m.thread_id = 'calls:01KFVCXF4ZBZGV7GXD7RQN6HHC'  -- Change this
+WHERE m.thread_id = 'calls:01JAAAAAAAAAAAAAAAAAAAAAAA'  -- Change this
 ORDER BY m.position_in_thread
 LIMIT 50;
 
