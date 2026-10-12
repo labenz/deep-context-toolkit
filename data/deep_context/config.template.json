@@ -51,15 +51,10 @@
   },
 
   "enrichment": {
-    "_comment": "OPTIONAL AI enrichment (quality/topics/sentiment per message) via Gemini — needs GEMINI_API_KEY; skipped cleanly without one. DEEP_CONTEXT_ENRICH_MODEL overrides model. All schema fields must be marked required (Gemini silently drops optional fields). public_sources = the only sources export-public will ever copy.",
-    "model": "gemini-3.7-flash",
-    "batch_size": 50
+    "_comment": "OPTIONAL AI enrichment of your own messages (quality/authorship/originality scores + topics + entities) via Gemini — needs GEMINI_API_KEY; skipped cleanly without one. DEEP_CONTEXT_ENRICH_MODEL overrides model. All schema fields must be marked required (Gemini silently drops optional fields).",
+    "model": "gemini-3.7-flash"
   },
 
-  "public_sources": ["podcast", "twitter"],
-
-  "synthesis": {
-    "_comment": "Higher-quality model for summary synthesis and strategic analysis. Any current Gemini model works; use a 'pro' tier for best quality. These are just defaults — override per your access.",
-    "model": "gemini-2.5-pro"
-  }
+  "_public_sources_comment": "The only sources export-public will ever copy into the low-access public DB.",
+  "public_sources": ["podcast", "twitter"]
 }
