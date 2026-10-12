@@ -1,4 +1,8 @@
-# Deep Context Toolkit -- Claude Code Project Instructions
+# Deep Context Toolkit -- Agent Instructions (Claude Code + Codex)
+
+> This file is the canonical project guide for any coding agent. Codex reads `AGENTS.md`
+> directly; Claude Code reads `CLAUDE.md`, which imports this file. Skills live in `skills/`
+> (also reachable as `.claude/skills/` and `.agents/skills/` so both harnesses discover them).
 
 This is the Deep Context personal knowledge base system. It extracts communications from multiple sources (Gmail, Slack, Beeper, GroupMe, Twitter, Fireflies calls), enriches them with AI-generated metadata, and provides universal search and synthesis across all sources. An optional **wiki layer** (see `WIKI.md` and the `summarize-monthly` + `wiki` skills) builds monthly summaries and a knowledge wiki on top.
 
@@ -8,7 +12,10 @@ All tools are Bun/TypeScript. Run with `bun tools/<tool>.ts` or `~/.bun/bin/bun 
 
 | Tool | Command | Purpose |
 |------|---------|---------|
-| Deep Context | `bun tools/deep-context.ts` | Main CLI: extract (incl. GroupMe), enrich, query, synthesize, todo, contacts |
+| Deep Context | `bun tools/deep-context.ts` | Main CLI: extract (incl. GroupMe), enrich, query (keyword/semantic/hybrid), recent, todo, embed, export-public, contacts |
+| Semantic | `tools/deep-context-semantic.ts` | Embeddings (Gemini or local Ollama), sqlite-vec sidecar, optional Voyage rerank (library, used by deep-context) |
+| Dropped balls | `bun tools/dropped-balls.ts` | Email threads awaiting your reply (last message inbound) |
+| Cron wrapper | `tools/deep-context-cron.sh` | Scheduled refresh run by your Claude Code / Codex subscription |
 | Gmail Extractor | `bun tools/gmail-extractor.ts` | Gmail extraction logic (called by deep-context); outbound + inbound-from-known passes |
 | Slack | `bun tools/slack.ts` | Slack API client (channels, DMs, search) |
 | Twitter | `bun tools/twitter-api.ts` | Official X API v2 client (user-tweets/liked-tweets/post/dm/etc.); live tweet fetch for extraction |
@@ -66,13 +73,14 @@ const OWNER_CONFIG = {
   twitterHandle: 'yourhandle',
   twitterId: '12345678',
   phone: '+1...',
+  agentEmails: { 'assistant@example.com': 'my-assistant' },  // optional: addresses your AI agents send from
   slackIdentifiers: {
     'workspace_name': { userId: 'UXXXXXXXX', searchQuery: 'from:@yourname', mentionQueries: ['@yourname'] }
   }
 };
 ```
 
-This is used throughout the codebase to identify which messages belong to the owner vs. other participants. It must be configured before first use. `gmail-extractor.ts` imports the same block. The `mentionQueries` per workspace drive the Slack "mentions" pass (threads where you're @-mentioned but haven't replied).
+This is used throughout the codebase to identify which messages belong to the owner vs. other participants. It must be configured before first use. `gmail-extractor.ts` imports the same block. Gmail matches `emails` **exactly** (list every address you send from). `agentEmails` tags mail your AI agents send as `messages.authored_by=<agent-id>`, so "my own writing" queries can exclude agent-written text. The `mentionQueries` per workspace drive the Slack "mentions" pass (threads where you're @-mentioned but haven't replied).
 
 ### Configuration Files
 
@@ -96,14 +104,25 @@ All secrets live in `tools/.env`. The env loader (`_lib/env.ts`) searches multip
 - **Gmail — two passes:** Pass 1 = owner's sent mail (`from:me`); Pass 2 = inbound mail from *known contacts* (`buildContactInboundQuery()` derives the contact list from existing threads where the owner participated). Threads with `my_message_count = 0` now get stored.
 - **Slack — three passes inside `extract slack`:** Pass 1 = owner's messages (`from:`); Pass 2 = threads where the owner is @-mentioned (`extractSlackMentions`, driven by `mentionQueries`); Pass 3 = full capture of channels/users in `tools/slack-capture-config.json` (`extractSlackChannelFull` via `loadSlackCaptureConfig`).
 - **GroupMe** is token-only (`GROUPME_ACCESS_TOKEN`); first run should pass `--backfill`.
+- **Multiple Google accounts:** `extract gmail --account <name>` reads a secondary mailbox into `source='gmail-<name>'` (own watermark, own tokens `GOOGLE_<NAME>_TOKEN/_REFRESH_TOKEN/_EMAIL`). The first interactive run opens the Google sign-in flow; verify you pick the right account.
+- **Phone numbers** in Beeper/iMessage thread titles are resolved to contact names at print time when `data/contacts.db` exists (`bun tools/contacts.ts export`, macOS) — stored data is not rewritten.
 
-### Enrichment
+### Enrichment (optional)
 
-- Uses Gemini (configured in `config.json`, default `gemini-3-flash`)
-- Processes only the owner's messages (`is_from_me = 1`)
-- Generates quality_score, originality_score, topics, sentiment, engagement, and more
-- All enrichment schema fields must be marked `required` (Gemini silently drops optional fields)
-- `--extracted-since` flag scopes enrichment to recently extracted content only (use it in cron runs to avoid re-processing the whole backlog)
+- Needs `GEMINI_API_KEY`; without it `enrich` prints a note and exits 0. Everything else works.
+- Model: `gemini-3.7-flash` by default (`DEEP_CONTEXT_ENRICH_MODEL` or `enrichment.model` in config.json to override). Stored per row in `message_metadata.processor_model`.
+- Processes only the owner's messages (`is_from_me = 1`); prompt/schema v2 marks each batch's messages `[MSG n]` and maps indexes back to IDs in code.
+- Robustness: up to 3 retries per batch (truncated structured output), context windowing for very large threads, per-batch writes (an interrupted run keeps its progress), skips rows already enriched by the current model.
+- All enrichment schema fields must be marked `required` (Gemini silently drops optional fields).
+- Scope scheduled runs with `--from <date>` (last_activity_at). Avoid `--extracted-since`: `extracted_at` is set only on insert, so it misses new replies in existing threads.
+
+### Semantic search (optional)
+
+- `query --semantic` / `--hybrid` over thread-chunk embeddings in a sidecar DB (`data/deep_context/deep_context_vectors_<provider>.db`, sqlite-vec). The main DB is never written by these commands.
+- Providers: Gemini `gemini-embedding-2` (`GEMINI_API_KEY`, default) or local Ollama `nomic-embed-text` (`DEEP_CONTEXT_EMBED_PROVIDER=ollama`, free and private).
+- Optional rerank: `VOYAGE_API_KEY` → Voyage `rerank-3` re-scores the top 50 hits. Absent key = vector order.
+- Build/maintain: `embed-backfill [--from] [--max-cost]`, `embed-update`, `embed-status`. macOS needs `brew install sqlite` (Apple's SQLite blocks extensions).
+- Settings like `DEEP_CONTEXT_*` / `OLLAMA_HOST` can live in `tools/.env`.
 
 ### Wiki Layer
 
@@ -138,12 +157,16 @@ deep-context init                              # Create DB and directories
 deep-context status                            # Extraction status and counts
 deep-context extract <source>                  # Extract from a source
 deep-context enrich --limit N                  # AI-enrich unprocessed messages
-deep-context query "term" [--source S]         # Search across all sources
+deep-context query "term" [--source S]         # Keyword search across all sources (no key needed)
+deep-context query "idea" --semantic|--hybrid  # Meaning-based search (needs embedding provider)
+deep-context embed-update | embed-status       # Maintain the semantic index
 deep-context recent --hours N                  # Browse recent threads
 deep-context synthesize <type>                 # Generate summaries
 deep-context export <type> --output FILE       # Export data
 deep-context extract-for-summary               # Generate LLM-ready summary doc
-deep-context todo list|recap|strategic         # Action item tracking
+deep-context todo list|add|update|expire|recap|strategic   # Action item tracking
+deep-context export-public [--push user@host:dir]          # Public-only FTS5 DB for low-access agents
+bun tools/dropped-balls.ts --days 30                       # Email awaiting your reply
 deep-context contacts <subcommand>             # Contact unification
 deep-context patch-html-emails                 # Clean up HTML email content
 deep-context patch-slack-mentions              # Resolve Slack @mentions
@@ -160,6 +183,7 @@ If the user asks to set up or configure the toolkit:
 5. **Copy config templates** -- `config.template.json` to `config.json`, `beeper-config.template.json` to `beeper-config.json`, and (if using Slack full-capture) `tools/slack-capture-config.template.json` to `tools/slack-capture-config.json`
 6. **Run `deep-context init`** to create the database
 7. **Test with `deep-context extract gmail`** as the first extraction
-8. **Run `deep-context enrich --limit 50`** to verify enrichment works
+8. **Optional:** add `GEMINI_API_KEY` and run `deep-context enrich --limit 50`; for semantic search run `deep-context embed-backfill --dry-run` (cost estimate) then without `--dry-run` (or use Ollama for free local embeddings)
+9. **Optional:** schedule `tools/deep-context-cron.sh` (see `templates/com.deep-context.update.plist`)
 
 Guide them interactively through each step. Not all sources are required -- Gmail alone provides significant value. Beeper, GroupMe, Twitter, and Calls can be added later. Once the knowledge base is populated, the optional **wiki layer** (`WIKI.md`, `summarize-monthly` + `wiki` skills) builds summaries and a knowledge wiki on top.

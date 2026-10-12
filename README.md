@@ -4,14 +4,29 @@ A personal knowledge base system that extracts your communications from Gmail, S
 
 The goal: give your AI assistant deep, searchable context about your professional and personal communications.
 
+Works with **Claude Code** or **Codex** — your existing Claude or ChatGPT subscription runs the setup, the scheduled refreshes, and the searches. The only API keys you need are the ones for the data sources you connect; the AI extras (enrichment, semantic search, reranking) are optional and degrade gracefully.
+
 On top of the raw knowledge base, an optional **wiki layer** turns the data into monthly narrative briefings and a browsable, two-repo (shared/private) knowledge wiki — see [WIKI.md](WIKI.md).
+
+## What's new (October 2026)
+
+- **Semantic + hybrid search** — `query --semantic` finds conversations by meaning, `--hybrid` merges keyword and semantic hits. Embeddings via Gemini (`gemini-embedding-2`) **or free and fully local via Ollama**; optional Voyage `rerank-3` pass for sharper top results. Stored in a separate sidecar DB; the main DB is never touched.
+- **Enrichment v2** — better default model (`gemini-3.7-flash`), indexed `[MSG n]` prompts that stop ID mix-ups, stricter entity grounding, retries on truncated output, windowing for huge threads, per-batch saves, and a clean skip when no Gemini key is configured.
+- **Agent-authorship tagging** — list the addresses your AI agents send from (`OWNER_CONFIG.agentEmails`) and their mail is tagged `authored_by=<agent>`, so "my own writing" stays yours.
+- **Multiple Google accounts** — `extract gmail --account work` pulls a second mailbox into its own source with its own watermark and tokens; first interactive run opens Google sign-in.
+- **TODO upgrades** — `todo expire` soft-expires stale incoming requests (reversible, never deletes); `todo update --reason` no longer breaks on apostrophes (it was building SQL by string concatenation); a ready-made scan prompt in `prompts/todo-scan.md`.
+- **`dropped-balls.ts`** — email threads where the last word is theirs, flagged 🔥 when you'd replied earlier and then went quiet.
+- **`export-public`** — builds a public-only (default: podcast + your tweets) full-text DB you can hand to low-access agents on another machine.
+- **Scheduled refresh on your subscription** — `tools/deep-context-cron.sh` runs the update skill headlessly with `claude` or `codex`, with locking, a deadline, an embedding refresh and an optional TODO scan; launchd template included.
+- **Fixes** — Gmail owner detection now uses exact addresses (the old substring match could swallow relatives/colleagues with similar addresses), phone-number chat titles resolve to contact names when printed, Beeper cursor pagination, Claude 5 "thinking" requests in `anthropic.ts`, orphaned temp files in `summarize.ts`, a missing Twitter archive is now a skip rather than an error.
+- **Works in Codex too** — `AGENTS.md` is the canonical agent guide (`CLAUDE.md` imports it), and skills are linked into both `.claude/skills` and `.agents/skills`.
 
 ## Architecture
 
 The system follows a three-stage pipeline:
 
 1. **Extract** -- Pull messages from each source into a normalized schema (threads + messages + people)
-2. **Enrich** -- AI metadata generation (via Gemini) scores each of your messages for quality, originality, topics, sentiment, and more
+2. **Enrich** *(optional)* -- AI metadata generation (via Gemini) scores each of your messages for quality, originality, topics, sentiment, and more; an optional embedding index adds meaning-based search
 3. **Synthesize** -- Higher-level summaries: relationship profiles, project timelines, communication preferences, thinking patterns
 
 All data lives in a single SQLite database with WAL mode for concurrent reads.
@@ -22,7 +37,7 @@ There's **no MCP server** here, and you don't need one. An AI agent reaches the 
 
 1. **The CLI is the search layer.** The agent shells out to `deep-context.ts` over Bash — `deep-context query "term" --source gmail --limit 20`, `deep-context recent --hours 24`, `deep-context synthesize relationships --person jane-doe`. It's a thin, composable wrapper over the SQLite DB so the agent writes commands instead of hand-rolling SQL, and the good default joins/ranking live in one place. You *could* point an agent straight at the raw `.db`, but the CLI keeps queries consistent and stops the agent from rediscovering the schema every session.
 
-2. **`CLAUDE.md` + the skills teach the agent the system exists.** This is the part people skip: the access mechanism isn't the database — it's *telling the agent the database exists and how you want it queried*. The repo's [`CLAUDE.md`](CLAUDE.md) documents the command vocabulary and auto-loads as project instructions; the `skills/` (`update-deep-context`, `summarize-monthly`, `wiki`) auto-discover and encode the multi-step procedures. That's the entire "integration."
+2. **`AGENTS.md`/`CLAUDE.md` + the skills teach the agent the system exists.** This is the part people skip: the access mechanism isn't the database — it's *telling the agent the database exists and how you want it queried*. The repo's [`AGENTS.md`](AGENTS.md) (imported by [`CLAUDE.md`](CLAUDE.md)) documents the command vocabulary and auto-loads as project instructions in Codex and Claude Code; the `skills/` (`update-deep-context`, `deep-context-reference`, `summarize-monthly`, `wiki`) auto-discover via `.claude/skills` / `.agents/skills` and encode the multi-step procedures. That's the entire "integration."
 
 3. **The wiki is the standing-context layer — plain markdown the agent reads directly.** The DB is for *retrieval when you need it*. The highest-value context is the stuff you want the agent to **already know** without querying: who the people in your life are, what your projects are, your positions and history. That's the wiki — a browsable set of articles generated *from* the DB (see [WIKI.md](WIKI.md)). The agent just reads those files. No query, no MCP, just markdown on disk:
 
@@ -55,18 +70,35 @@ Early versions captured mostly your *outbound* messages. The system now also cap
 
 ## Quick Start
 
-1. Clone or unzip this folder
+1. Clone this repo: `git clone https://github.com/labenz/deep-context-toolkit.git && cd deep-context-toolkit`
 2. Install Bun: `curl -fsSL https://bun.sh/install | bash`
-3. Install dependencies: `cd tools && bun install`
-4. Open Claude Code in this directory and say:
+3. Install dependencies: `cd tools && bun install && cd ..`
+4. (macOS, for semantic search) `brew install sqlite`
+5. Open **Claude Code** (`claude`) or **Codex** (`codex`) in this directory and say:
 
 ```
-"I just set up the deep-context toolkit. Help me configure it for my
-accounts. I need to: (1) set up Google OAuth for Gmail access, (2) connect
-my Slack workspaces, (3) optionally set up Beeper, Twitter, and Fireflies.
-Walk me through each one. Start by reading the README.md and
-.env.example, then guide me through setup interactively."
+"I just cloned the deep-context toolkit. Help me configure it for my
+accounts: fill in OWNER_CONFIG, then (1) Google OAuth for Gmail,
+(2) my Slack workspaces, (3) optionally Beeper, Twitter, and Fireflies.
+Start by reading AGENTS.md, README.md and .env.example, then guide me
+through setup interactively. Run init and a first Gmail extraction when
+we're done, and show me a few searches."
 ```
+
+6. Optional extras, in order of value: schedule refreshes (`tools/deep-context-cron.sh`), semantic search (`embed-backfill`), enrichment (`GEMINI_API_KEY`), the wiki layer ([WIKI.md](WIKI.md)).
+
+### Keys: required vs optional
+
+| Capability | Needs | Without it |
+|---|---|---|
+| Gmail extraction | Google OAuth client (`GOOGLE_CLIENT_ID/SECRET`) | — |
+| Slack / Beeper / GroupMe / Fireflies / X live | that source's token | source is skipped |
+| Keyword search, `recent`, todos, exports, dropped-balls | nothing | — |
+| Scheduled refresh | a Claude Code or Codex subscription (CLI installed) | run `/update-deep-context` by hand |
+| Enrichment (quality/topics/sentiment) | `GEMINI_API_KEY` | `enrich` skips cleanly |
+| Semantic / hybrid search | `GEMINI_API_KEY` **or** local Ollama (`DEEP_CONTEXT_EMBED_PROVIDER=ollama`, `ollama pull nomic-embed-text`) | keyword search only |
+| Rerank of semantic results | `VOYAGE_API_KEY` | vector order |
+| Wiki layer summaries | your agent session (or `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/`GEMINI_API_KEY` for `summarize.ts` batch runs) | — |
 
 ## Prerequisites
 
@@ -77,7 +109,10 @@ Walk me through each one. Start by reading the README.md and
 - **GroupMe access token** (optional) -- create an app at dev.groupme.com; token-only, no desktop app
 - **Twitter/X** (optional) -- archive import (download from x.com/settings, no credentials needed) and/or live fetch via the official X API v2 (create an app at developer.x.com, set the `X_API_*` keys)
 - **Fireflies API key** (optional) -- requires Business plan for transcript access
-- **Gemini API key** -- for enrichment (gemini-3-flash) and synthesis
+- **Gemini API key** (optional) -- enrichment (`gemini-3.7-flash`), synthesis, and default embeddings for semantic search
+- **Ollama** (optional) -- free local embeddings for semantic search instead of Gemini
+- **Voyage API key** (optional) -- rerank for semantic search
+- **Homebrew SQLite** (macOS, for semantic search) -- `brew install sqlite`; Apple's built-in SQLite can't load the sqlite-vec extension
 - **Anthropic API key** (optional) -- for the wiki layer (summaries + article generation) and LLM contact matching
 - **macOS recommended** -- Beeper Desktop and macOS Contacts integration are macOS-native
 
@@ -87,13 +122,15 @@ Walk me through each one. Start by reading the README.md and
 deep-context-toolkit/
   tools/
     deep-context.ts          # Main CLI -- all commands run through here (GroupMe extraction lives here too)
+    deep-context-semantic.ts # Embeddings (Gemini / Ollama), sqlite-vec index, optional Voyage rerank
+    deep-context-cron.sh     # Scheduled refresh via your Claude Code / Codex subscription
+    dropped-balls.ts         # Email threads awaiting your reply
     gmail-extractor.ts       # Gmail extraction logic (outbound + inbound-from-known passes)
     slack.ts                 # Slack API client
     twitter-api.ts           # Twitter/X official API v2 client (live tweet fetch)
     beeper.ts                # Beeper Desktop API client
     calls.ts                 # Call transcript management (Fireflies)
     contacts.ts              # macOS Contacts integration
-    calls.ts                 # Call transcript management
     fireflies.ts             # Fireflies.ai API client (used by calls.ts)
     deepgram.ts              # Deepgram API client (audio re-transcription, optional)
     gemini.ts / anthropic.ts / openai.ts   # LLM provider clients (enrichment, synthesis, summaries)
@@ -115,10 +152,14 @@ deep-context-toolkit/
       wiki-private/          # PRIVATE wiki (source of truth; never published)
   wiki/                      # SHARED wiki repo starter (publishable; host on a private GitHub repo)
     _build_index.ts          # Rebuilds backlinks / entity registry / index pages
-  skills/
-    update-deep-context/     # Keep the knowledge base fresh (extract + enrich)
+  skills/                    # (linked as .claude/skills and .agents/skills)
+    update-deep-context/     # Keep the knowledge base fresh (extract + enrich + embed)
+    deep-context-reference/  # Command/query reference the agent consults when searching
     summarize-monthly/       # Generate monthly narrative briefings
     wiki/                    # Build & maintain the knowledge wiki
+  prompts/todo-scan.md       # Headless TODO-detection prompt (used by the cron wrapper --todo)
+  templates/                 # launchd plist for scheduled refreshes
+  AGENTS.md / CLAUDE.md      # Agent instructions (Codex / Claude Code)
   WIKI.md                    # The wiki layer: architecture + setup guide
 ```
 
@@ -142,13 +183,22 @@ deep-context extract groupme         # Extract GroupMe (use --backfill on first 
 deep-context extract twitter         # Import Twitter archive + live fetch
 deep-context extract calls           # Extract call transcripts
 
-# Enrichment
-deep-context enrich --limit 200      # AI-enrich up to 200 unprocessed messages
+# Enrichment (optional; needs GEMINI_API_KEY)
+deep-context enrich --limit 200 --from 2026-10-01   # AI-enrich owner messages in threads active since a date
+
+# Semantic search index (optional; Gemini or local Ollama)
+deep-context embed-backfill --dry-run                # chunk count + cost estimate
+deep-context embed-backfill --max-cost 2             # build it (resumable)
+deep-context embed-update                            # add anything new
+deep-context embed-status                            # coverage
 
 # Search
-deep-context query "search term"     # Full-text search across all sources
+deep-context query "search term"     # Keyword search across all sources
+deep-context query "an idea, in other words" --semantic   # meaning-based
+deep-context query "topic" --hybrid  # keyword + semantic, merged
 deep-context query "term" --source gmail --limit 20
 deep-context recent --hours 24       # Browse recent threads without a search term
+bun tools/dropped-balls.ts --days 30 # Email threads awaiting your reply
 
 # Synthesis
 deep-context synthesize timeline --from 2025-01-01 --to 2025-12-31
@@ -160,11 +210,13 @@ deep-context synthesize thinking
 # Export
 deep-context export people --output people.json
 deep-context extract-for-summary --from 2025-01-01 --to 2025-06-30
+deep-context export-public --push agent@other-mac:~/.agent-data   # public-only DB for low-access agents
 
 # Todo tracking (auto-detected from messages)
 deep-context todo list               # View detected action items
 deep-context todo recap --since 24   # Last 24 hours of action items
 deep-context todo strategic          # Birds-eye organizational analysis
+deep-context todo expire --dry-run   # Stale incoming requests that would be soft-expired
 
 # Contact unification
 deep-context contacts status         # Show dedup progress
@@ -181,6 +233,7 @@ Copy `data/deep_context/config.template.json` to `data/deep_context/config.json`
 - **privacy** -- emails, phone patterns, and names to exclude globally
 - **extraction** -- per-source settings (Slack workspaces, Twitter archive path, etc.)
 - **enrichment** -- AI model and batch size for metadata generation
+- **public_sources** -- the only sources `export-public` will ever copy (default podcast + twitter)
 - **synthesis** -- AI model for higher-level summaries
 
 ### beeper-config.json
@@ -204,8 +257,12 @@ GOOGLE_REFRESH_TOKEN=
 # Slack (one token per workspace)
 SLACK_BOT_TOKEN_MYWORKSPACE=xoxb-...
 
-# Gemini (required for enrichment/synthesis)
+# Gemini (optional -- enrichment, synthesis, default semantic-search embeddings)
 GEMINI_API_KEY=
+
+# Semantic search (optional): local embeddings instead of Gemini, and reranking
+# DEEP_CONTEXT_EMBED_PROVIDER=ollama
+VOYAGE_API_KEY=
 
 # Beeper (optional)
 BEEPER_ACCESS_TOKEN=
@@ -229,7 +286,7 @@ ANTHROPIC_API_KEY=
 
 ### OWNER_CONFIG
 
-In `tools/deep-context.ts`, the `OWNER_CONFIG` block at the top of the file must be filled in with your identity information (name, emails, Twitter handle, Slack user IDs + per-workspace search/mention queries). This is how the system knows which messages are yours vs. other participants'. The `gmail-extractor.ts` imports this same block.
+In `tools/deep-context.ts`, the `OWNER_CONFIG` block at the top of the file must be filled in with your identity information (name, **every email address you send from** — matching is exact — Twitter handle, Slack user IDs + per-workspace search/mention queries, and optionally `agentEmails` for addresses your AI agents send from). This is how the system knows which messages are yours vs. other participants'. The `gmail-extractor.ts` imports this same block.
 
 ## The Wiki Layer (optional, but the most valuable part)
 
@@ -244,6 +301,10 @@ deep-context DB  →  extract-for-summary  →  /summarize-monthly  →  /wiki u
 
 This is what lets an AI assistant get rich context about you without ever touching your raw inbox. See **[WIKI.md](WIKI.md)** for the full architecture and first-time setup, and the `summarize-monthly` and `wiki` skills for the commands.
 
+## Scheduling
+
+`tools/deep-context-cron.sh` keeps the knowledge base fresh without API-key billing for the agent: it runs the `update-deep-context` skill through your installed `claude` (or `codex`, via `DC_AGENT=codex`) CLI, so it uses your subscription. It holds a lock, enforces a wall-clock deadline, refreshes the embedding index, and with `--todo` runs a TODO scan. Install the launchd job from `templates/com.deep-context.update.plist` (instructions inside) or add a crontab line. Logs go to `logs/deep-context-cron.log`.
+
 ## Database
 
 The SQLite database is auto-created at `data/deep_context/deep_context.db` when you run `deep-context init`. The schema is defined in `data/deep_context/schema.sql`.
@@ -253,8 +314,11 @@ Key tables:
 - **messages** -- Individual messages within threads
 - **people** -- Contacts extracted from communications
 - **message_metadata** -- AI-generated enrichment (quality, topics, sentiment, etc.)
+- **messages.authored_by** -- whose words a message is (agent-sent mail is tagged; NULL = not judged)
 - **syntheses** -- Generated summaries (timelines, relationship profiles, etc.)
 - **todo_items** -- Action items auto-detected from messages
 - **unified_contacts** -- Deduplicated contact records
+
+Semantic search keeps its vectors in a separate sidecar file (`deep_context_vectors_<provider>.db`) so the main database is never modified by indexing.
 
 The database uses WAL mode for concurrent read access. Close other database viewers before running extractions to avoid write contention.

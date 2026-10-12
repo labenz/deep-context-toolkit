@@ -63,6 +63,10 @@ Every run checks ALL 7 default sources unless narrowed by named sources or `--ex
 - slack-mentions / slack-channel-full — sub-passes of `extract slack`; can be run standalone
 - podcast — owner-specific (reads a local `episodes.csv` + transcript files). Only relevant if you produce a podcast; enable in `config.json` and run `extract podcast` explicitly.
 - imessage — deprecated, use `beeper` for iMessage going forward
+- **gmail --account <name>** — a secondary Google account (work, travel, …). Lands under
+  `source='gmail-<name>'` with its own incremental watermark, so it never shifts the primary
+  mailbox's start date. Authorize once with `extract gmail --account <name>` (device flow;
+  sign in as that account), then add it to your routine if you want it every run.
 
 ---
 
@@ -140,7 +144,9 @@ For each source in the update set, run the corresponding command. Continue to th
 | twitter | `~/.bun/bin/bun tools/deep-context.ts extract twitter` |
 
 For each extraction:
-- Run via sub-agent (Task tool) to keep main context clean — extraction output is verbose
+- Extraction output is verbose: in Claude Code, a sub-agent keeps the main context clean; in
+  Codex or a headless run, redirect each source's output to its own log file and read the tail.
+  Either way, wait for each command to finish before starting the next.
 - Record: success/failure, items extracted, new threads/messages, errors
 - On failure: log the error, continue to next source
 
@@ -148,18 +154,43 @@ For each extraction:
 
 Skip this phase if `--skip-enrich` was specified.
 
-**Important:** Only enrich threads that were newly extracted or updated in this run. This prevents the enrichment step from getting stuck on the massive backlog of old threads and blocking cron runs.
+Enrichment is **optional** — it needs `GEMINI_API_KEY`. Without one, `enrich` prints a one-line
+note and exits 0; report enrichment as "skipped (no key)" and move on.
+
+**Important:** Only enrich threads active in this run's window. This prevents the enrichment step from getting stuck on the massive backlog of old threads and blocking scheduled runs.
 
 1. Determine enrichment limit:
    - Default: 200 threads
    - `--enrich-limit N`: Use N
    - `--full`: 500 threads
-2. Record the timestamp from when Phase 2 started (ISO 8601 format, e.g. `2026-02-12T04:50:00Z`)
-3. Run: `~/.bun/bin/bun tools/deep-context.ts enrich --limit <N> --extracted-since <phase2_start_timestamp>`
-   - The `--extracted-since` flag scopes enrichment to only threads whose `extracted_at` >= the given timestamp
-   - This ensures only content from the current extraction run gets enriched, not the full backlog
-4. Run via sub-agent — enrichment is verbose and may take minutes
-5. On Gemini 429 (quota exhausted): report progress so far, don't treat as failure
+2. Pick a lookback date matching the extraction window (e.g. 7 days ago)
+3. Run: `~/.bun/bin/bun tools/deep-context.ts enrich --limit <N> --from <lookback_date>`
+   - `--from` filters on `threads.last_activity_at`, which updates whenever a thread gets new
+     messages — so it catches both brand-new threads AND new replies in existing threads.
+   - **Don't use `--extracted-since`**: `threads.extracted_at` is set only on insert and never
+     bumped on update, so it sees only brand-new threads — which are usually inbound-only and
+     skipped by design (enrichment covers the owner's own messages). The typical result is
+     "All threads are already enriched!" with zero work done.
+4. Sanity-check the backlog before/after so "0 enriched" is never ambiguous:
+   ```sql
+   SELECT COUNT(m.id) FROM threads t
+     JOIN messages m ON m.thread_id = t.id AND m.is_from_me = 1
+     LEFT JOIN message_metadata mm ON m.id = mm.message_id
+   WHERE t.my_message_count > 0 AND mm.message_id IS NULL
+     AND t.last_activity_at >= '<lookback_date>';
+   ```
+5. Enrichment is verbose and can run 20+ minutes on large group threads; capture its log and wait.
+   Failed/truncated batches retry up to 3x and every batch is saved as it completes, so an
+   interrupted run resumes where it left off.
+6. On Gemini 429 (quota exhausted): report progress so far, don't treat as failure
+
+### Phase 3b: Semantic index (optional)
+
+If an embedding provider is configured (`GEMINI_API_KEY`, or `DEEP_CONTEXT_EMBED_PROVIDER=ollama`),
+run `~/.bun/bin/bun tools/deep-context.ts embed-update --max-cost 0.50` so `query --semantic`
+covers the new messages. It is resumable and additive. Without a provider it exits with a
+short explanation — report "skipped (no embedding provider)". The scheduled wrapper
+(`tools/deep-context-cron.sh`) runs this stage itself, so skip it when invoked from there.
 
 ### Phase 4: Summary Report
 
@@ -292,9 +323,11 @@ Status values: **OK** (ran successfully), **SKIP** (excluded or prerequisite fai
 
 ## Scheduling (optional)
 
-To run this on a schedule, wire it into your OS scheduler (e.g. a macOS launchd plist or a cron
-job) that invokes the Claude CLI with `/update-deep-context`. Keep the schedule modest
-(2-3x/day is plenty) and log output so you can spot silent failures.
+`tools/deep-context-cron.sh` runs this skill headlessly with whichever subscription CLI you have
+(`claude` or `codex`; `DC_AGENT=` to choose), takes a lock so runs never overlap, then refreshes
+the semantic index and (with `--todo`) runs a TODO scan from `prompts/todo-scan.md`. A macOS
+launchd template is in `templates/com.deep-context.update.plist`; a crontab line works too.
+2-3 runs a day is plenty. Logs: `logs/deep-context-cron.log`.
 
 ## The layer on top: summaries + wiki
 
