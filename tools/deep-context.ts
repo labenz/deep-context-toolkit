@@ -1,28 +1,16 @@
 #!/usr/bin/env bun
 
 // Deep Context CLI - Personal knowledge base management
-// Extracts communications, enriches with metadata, generates syntheses
+// Extracts communications, enriches with metadata, searches (keyword + semantic), tracks TODOs
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, copyFileSync, statSync, renameSync, unlinkSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, renameSync, unlinkSync } from 'fs'
 import { parse_flags, print_help, type ParsedArgs, type FlagSchema } from './_lib/cli'
 import { dirname, join } from 'path'
 import Database from 'bun:sqlite'
 import { load_env, PROJECT_ROOT } from './_lib/env'
 import { request } from './_lib/http'
 import { pick_existing_access_token, try_refresh_token, start_device_auth, update_project_env_vars } from './_lib/google_oauth'
-import {
-  findMatchCandidates,
-  calculateConfidence,
-  comparePersons,
-  parseIdentifiers,
-  isAutomatedSender,
-  groupCandidates,
-  normalizePhoneFromBeeperId,
-  type PersonRecord,
-  type MatchCandidate,
-  type MatchSignal
-} from './_lib/contact-matching'
-import { evaluateWithLLM, batchEvaluateWithLLM, type LLMMatchResult } from './_lib/contact-llm'
+import { normalizePhoneFromBeeperId } from './_lib/contact-matching'
 import EmailReplyParser from 'email-reply-parser'
 import { convertHtmlToText, extractGmail as extractGmailRaw, GMAIL_SOURCE } from './gmail-extractor'
 import {
@@ -65,156 +53,63 @@ export const OWNER_CONFIG = {
 };
 
 const USAGE = `
-deep-context — Personal knowledge base for LLM digital assistant
+deep-context — Personal knowledge base for your AI agent
 
 USAGE:
-  # Initialize database and directory structure
+  # Set up and check
   deep-context init [--force]
-
-  # Show extraction and processing status
   deep-context status [--source SOURCE] [--json]
 
-  # Extract from a data source
-  deep-context extract <source> [--from DATE] [--to DATE] [--limit N] [--dry-run] [--backfill]
+  # Pull in data
+  deep-context extract <source> [--from DATE] [--to DATE] [--limit N] [--dry-run] [--backfill] [--account NAME]
     Sources: gmail, slack, slack-mentions, slack-channel-full, slack-dm, beeper, groupme, twitter, twitter-live, calls, podcast
+  deep-context backfill slack <mentions|channel-full> [--from DATE] [--to DATE] [--restart] [--channel ID] [--chunk-months N]
+    Checkpointed, resumable multi-year Slack history load (use once at setup).
 
-  # Run metadata enrichment on unprocessed messages
-  deep-context enrich [--limit N] [--source SOURCE] [--extracted-since DATE] [--dry-run]
-
-  # Generate/update syntheses
-  deep-context synthesize <type> [--person ID] [--project ID] [--force]
-    Types: timeline, relationships, projects, preferences, thinking
-
-  # Search the database (keyword LIKE search by default — no API key needed)
-  deep-context query <search_term> [--source SOURCE] [--from DATE] [--to DATE] [--limit N]
+  # Search (keyword LIKE search by default — no API key needed)
+  deep-context query <search_term> [--source SOURCE] [--from DATE] [--to DATE] [--limit N] [--json]
     --semantic   Vector search over embedded conversation chunks (meaning, not keywords)
     --hybrid     Combine keyword + semantic results (reranked together; RRF by thread if rerank off)
     --no-rerank  Skip the optional Voyage rerank-3 pass (used automatically for --semantic/--hybrid
                  when VOYAGE_API_KEY is set; also off via DEEP_CONTEXT_RERANK=0).
-    Semantic search requires a vector index — build with embed-backfill first.
     Embedding provider: Gemini (GEMINI_API_KEY) by default, or local Ollama with
     DEEP_CONTEXT_EMBED_PROVIDER=ollama (free, private; ollama pull nomic-embed-text).
+  deep-context recent [--hours N] [--source SOURCE] [--limit N]    Browse recent threads
 
-  # Build / maintain the semantic vector index (sidecar DB: deep_context_vectors_<provider>.db)
-  deep-context embed-backfill [--source S] [--from DATE] [--to DATE] [--limit N] [--dry-run]
-                              [--batch-size N] [--max-cost DOLLARS]
-    Embeds thread-chunks (consecutive messages, <=~5.5K chars) into a sqlite-vec index.
-    Resumable: safe to interrupt and rerun (tracks per-thread state + chunk content
-    hashes; skips what's already embedded). Purely additive — never writes to
-    deep_context.db (opens it read-only). --limit caps chunks embedded this run;
-    --max-cost stops at an estimated spend. --dry-run reports chunk count + cost.
-  deep-context embed-update            Alias for embed-backfill (embeds anything new)
-  deep-context embed-status            Show vector index coverage and estimated spend
+  # Semantic index (sidecar DB: deep_context_vectors_<provider>.db; never writes deep_context.db)
+  deep-context embed-backfill [--source S] [--from DATE] [--to DATE] [--limit N] [--dry-run] [--max-cost DOLLARS]
+    Resumable: safe to interrupt and rerun. --dry-run reports chunk count + cost.
+  deep-context embed-update            Embed anything new (same as embed-backfill)
+  deep-context embed-status            Vector index coverage and estimated spend
 
-  # Export data or syntheses
-  deep-context export <type> --output FILE [--format FORMAT]
-    Types: messages, people, syntheses
+  # Optional AI metadata on your own messages (needs GEMINI_API_KEY; skips cleanly without)
+  deep-context enrich [--limit N] [--source SOURCE] [--from DATE] [--to DATE] [--dry-run]
+    Writes quality / authorship / originality scores + topics + entities to message_metadata.
 
-  # Build a public-only DB (default: podcast + your own tweets) with an FTS5 index
+  # Action items
+  deep-context todo list [--status S] [--category C] [--limit N]
+  deep-context todo add --title "..." --category committed|incoming --source SOURCE
+                        [--context "..."] [--related-person NAME] [--priority P] [--due DATE] [--tags T]
+  deep-context todo update <id-prefix> --status accepted|dismissed|completed [--reason "..."]
+  deep-context todo expire [--days N] [--dry-run]  Soft-expire stale incoming items (reversible)
+  deep-context todo recap [--since HOURS]       What's new for a daily briefing
+  deep-context todo strategic                   Birds-eye organizational view
+
+  # Exports
+  deep-context extract-for-summary --from DATE --to DATE [--output FILE] [--token-budget N] [--include-low-quality]
+    Thread-centric markdown for monthly summaries (feeds /summarize-monthly and the wiki).
   deep-context export-public [--output FILE] [--push USER@HOST:DIR]
-    Builds a slim, queryable SQLite file containing ONLY public sources plus a
-    full-text index — safe to hand to low-access agents (e.g. on another machine)
-    that should never see your private mail/chats. Sources come from
-    config.json "public_sources" (default ["podcast", "twitter"]). --push scp's the
-    file to a remote directory. Default output: data/deep_context/public_deep_context.db
-
-  # Extract content for LLM summarization (thread-centric view)
-  deep-context extract-for-summary --from DATE --to DATE [--output FILE] [--token-budget N]
-    Generates a markdown document with cross-source chronological view,
-    thread-centric organization, adaptive detail levels by content type,
-    and windowing for long-running conversations.
-
-  # Run incremental update (extract new, enrich, re-synthesize)
-  deep-context update [--dry-run]
-
-  # Patch existing HTML emails with clean plain text conversion
-  deep-context patch-html-emails [--dry-run] [--limit N]
-    Finds Gmail messages with raw HTML content (<!DOCTYPE, <html>, <table>, etc.)
-    and converts them to clean plain text using html-to-text library.
-
-  # Patch Slack user mentions (<@U12345>) to @DisplayName
-  deep-context patch-slack-mentions [--dry-run] [--limit N]
-    Resolves user mentions in existing Slack messages using the cached user data.
-
-  # Contact unification commands
-  deep-context contacts status                    Show unification progress
-  deep-context contacts suggest [--use-llm]       Generate match suggestions
-  deep-context contacts review [--limit N]        Interactive review
-  deep-context contacts review --auto-accept 0.99 Auto-accept high confidence
-  deep-context contacts auto-accept [--min-confidence N] [--dry-run]  Batch accept suggestions
-  deep-context contacts enrich-slack [--dry-run]  Fetch emails for Slack users
-  deep-context contacts link <person1> <person2>  Manually link two records
-  deep-context contacts reject <person1> <person2> Mark as not the same person
-  deep-context contacts unify <p1> [p2...] --name NAME  Create unified contact
-  deep-context contacts search <query>            Search unified contacts
-  deep-context contacts show <id>                 Show unified contact details
-  deep-context contacts analyze [--min-domains N] Find contaminated records (default: 3+ domains)
-  deep-context contacts split <id> [--dry-run]    Split contaminated record by email domain
-  deep-context contacts rebuild-gmail [--dry-run] Re-derive Gmail person IDs from raw headers
-
-  # Migrate Twitter threads (one-time migration + runs on future extracts)
-  deep-context migrate-twitter-threads [--dry-run]
-    Phase 1: Groups self-reply chains into proper threads (thread_type='thread')
-    Phase 2: Adds parent tweet stubs for replies to others (reply context)
-
-  # Hydrate placeholder stubs with actual tweet text from like.js
-  deep-context hydrate-twitter-stubs [--dry-run]
-
-  # Dedup beeper iMessage messages against native imessage source
-  deep-context dedup-beeper-imessage [--dry-run]
-    Removes beeper iMessage messages that duplicate existing imessage records
-    (matched by source_message_id UUID). Cleans up empty threads and orphaned metadata.
-
-OPTIONS:
-  --source, -s SOURCE    Filter by data source (gmail, slack, beeper, twitter, calls, podcast)
-  --from DATE            Start date (YYYY-MM-DD)
-  --to DATE              End date (YYYY-MM-DD)
-  --limit, -l N          Maximum items to process
-  --person ID            Person ID for relationship synthesis
-  --project ID           Project ID for project synthesis
-  --format FORMAT        Export format: json, csv, markdown (default: json)
-  --output, -o FILE      Output file path
-  --token-budget N       Target token budget for extract-for-summary (default: 300000)
-  --overlap N            Overlap messages for windowed threads (default: 20)
-  --include-low-quality  Include low quality/originality messages (default: exclude <=3)
-  --force                Overwrite existing data
-  --dry-run              Preview changes without writing
-  --json                 Output as JSON
+    Slim FTS5 DB of ONLY public sources (config.json "public_sources", default
+    ["podcast", "twitter"]) — safe to hand to low-access agents.
 
 EXAMPLES:
-  # Initialize the system
   deep-context init
-
-  # Check extraction status
-  deep-context status
-
-  # Extract Gmail messages from last 30 days
   deep-context extract gmail --from 2026-01-01
-
-  # Extract Twitter archive
-  deep-context extract twitter
-
-  # Enrich 100 messages with metadata
-  deep-context enrich --limit 100
-
-  # Generate timeline for 2025
-  deep-context synthesize timeline --from 2025-01-01 --to 2025-12-31
-
-  # Generate relationship summary for a person
-  deep-context synthesize relationships --person john-doe
-
-  # Search for messages mentioning "project-name"
-  deep-context query "project-name" --source gmail
-
-  # Semantic search (finds paraphrases keyword search misses)
+  deep-context query "project-name" --source gmail --limit 20
   deep-context query "frustrated with the vendor's turnaround time" --semantic
-  deep-context query "planning the kids' summer activities" --hybrid --limit 10
-
-  # Build the vector index for recent mail, capped at $0.50
+  deep-context recent --hours 24
   deep-context embed-backfill --from 2026-05-01 --max-cost 0.50
-
-  # Export all people to JSON
-  deep-context export people --output people.json
+  deep-context todo recap --since 24
 `
 
 // Paths
@@ -232,27 +127,14 @@ const CONFIG_PATH = join(DATA_DIR, 'config.json')
 
 // Directory structure
 const DIRECTORIES = [
-  'extracts/gmail',
-  'extracts/slack',
-  'extracts/beeper',
-  'extracts/twitter',
-  'extracts/calls',
-  'extracts/podcast',
-  'syntheses/timeline',
-  'syntheses/relationships',
-  'syntheses/projects',
-  'writing_samples/emails',
-  'writing_samples/tweets',
-  'writing_samples/essays'
+  'summaries/monthly-exports',
+  'summaries/monthly-summaries',
+  'summaries/annual-summaries',
 ]
 
 // Valid sources
 const VALID_SOURCES = ['gmail', 'slack', 'slack-mentions', 'slack-channel-full', 'slack-dm', 'beeper', 'groupme', 'twitter', 'twitter-live', 'calls', 'podcast'] as const
 type Source = typeof VALID_SOURCES[number]
-
-// Valid synthesis types
-const SYNTHESIS_TYPES = ['timeline', 'relationships', 'projects', 'preferences', 'thinking'] as const
-type SynthesisType = typeof SYNTHESIS_TYPES[number]
 
 function getDb(): Database {
   if (!existsSync(DB_PATH)) {
@@ -321,6 +203,12 @@ function getDb(): Database {
   }
   if (msgCols.size > 0 && !msgCols.has('authorship_evidence')) {
     db.exec(`ALTER TABLE messages ADD COLUMN authorship_evidence TEXT`)
+  }
+  // Migrate: threads.network (messaging network label read by extract-for-summary;
+  // older schema.sql never declared it, so that command failed with "no such column").
+  const threadCols = new Set((db.query(`PRAGMA table_info(threads)`).all() as Array<{ name: string }>).map(c => c.name))
+  if (threadCols.size > 0 && !threadCols.has('network')) {
+    db.exec(`ALTER TABLE threads ADD COLUMN network TEXT`)
   }
 
   return db
@@ -452,13 +340,8 @@ async function cmdInit(args: ParsedArgs): Promise<void> {
         beeper: { skip_twitter: true },
         twitter: { archive_path: '' }
       },
-      enrichment: {
-        model: 'gemini-2.5-flash',
-        batch_size: 50
-      },
-      synthesis: {
-        model: 'gemini-3.1-pro-preview'
-      }
+      // enrichment.model is optional; leave unset to use DEFAULT_ENRICH_MODEL
+      enrichment: {}
     }
     await Bun.write(CONFIG_PATH, JSON.stringify(defaultConfig, null, 2))
     console.log(`  Created: config.json`)
@@ -504,12 +387,6 @@ async function cmdStatus(args: ParsedArgs): Promise<void> {
     GROUP BY source
   `).all() as { source: string; last_extraction: string; newest_item: string; total_items: number }[]
 
-  // Get synthesis counts
-  const syntheses = db.query(`
-    SELECT synthesis_type, COUNT(*) as count, MAX(updated_at) as last_updated
-    FROM syntheses GROUP BY synthesis_type
-  `).all() as { synthesis_type: string; count: number; last_updated: string }[]
-
   db.close()
 
   if (jsonOutput) {
@@ -524,8 +401,7 @@ async function cmdStatus(args: ParsedArgs): Promise<void> {
           ? Math.round(enrichedCount.count / totalMyMessages.count * 100)
           : 0
       },
-      extractions,
-      syntheses
+      extractions
     }, null, 2))
     return
   }
@@ -591,17 +467,6 @@ async function cmdStatus(args: ParsedArgs): Promise<void> {
     for (const e of extractions) {
       if (sourceFilter && e.source !== sourceFilter) continue
       console.log(`${e.source.padEnd(12)} ${formatDate(e.last_extraction).padEnd(22)} ${formatDate(e.newest_item).padEnd(22)} ${formatNumber(e.total_items).padStart(8)}`)
-    }
-  }
-
-  // Syntheses
-  console.log('\n\nSYNTHESES')
-  console.log('───────────────────────────────────────────────────────────────')
-  if (syntheses.length === 0) {
-    console.log('No syntheses generated yet.')
-  } else {
-    for (const s of syntheses) {
-      console.log(`${s.synthesis_type.padEnd(15)} ${formatNumber(s.count)} entries, last updated ${formatDate(s.last_updated)}`)
     }
   }
 
@@ -1502,225 +1367,6 @@ function loadLikeIndex(archivePath: string): Map<string, string> {
   }
   console.log(`  Loaded ${formatNumber(index.size)} liked tweets from archive`)
   return index
-}
-
-// Migration command: runs Phase 1 then Phase 2 on existing data
-async function cmdMigrateTwitterThreads(args: ParsedArgs): Promise<void> {
-  const dryRun = !!args.flags['dry-run']
-  const db = getDb()
-
-  console.log('\n=== Twitter Thread Grouping Migration ===\n')
-
-  // Pre-migration counts
-  const preCounts = {
-    threads: (db.query(`SELECT COUNT(*) as cnt FROM threads WHERE source = 'twitter'`).get() as { cnt: number }).cnt,
-    messages: (db.query(`SELECT COUNT(*) as cnt FROM messages WHERE source = 'twitter' AND content_type != 'dm'`).get() as { cnt: number }).cnt,
-    selfReplies: (db.query(`
-      SELECT COUNT(*) as cnt FROM messages
-      WHERE source = 'twitter' AND content_type != 'dm'
-        AND reply_to_message_id IN (SELECT id FROM messages WHERE source = 'twitter')
-    `).get() as { cnt: number }).cnt,
-  }
-
-  console.log('Pre-migration counts:')
-  console.log(`  Threads: ${formatNumber(preCounts.threads)}`)
-  console.log(`  Messages: ${formatNumber(preCounts.messages)}`)
-  console.log(`  Self-replies (chainable): ${formatNumber(preCounts.selfReplies)}`)
-  console.log()
-
-  if (!dryRun) {
-    // Back up database
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
-    const backupPath = `${DB_PATH}.bak-${timestamp}`
-    copyFileSync(DB_PATH, backupPath)
-    console.log(`Database backed up to: ${backupPath}`)
-    console.log()
-  }
-
-  // Phase 1: Group self-reply chains
-  console.log('--- Phase 1: Group self-reply chains ---')
-  if (!dryRun) db.exec('BEGIN TRANSACTION')
-
-  try {
-    const phase1 = groupTwitterSelfReplies(db, { dryRun })
-
-    if (!dryRun) {
-      // Verify message count unchanged
-      const postMessages = (db.query(`SELECT COUNT(*) as cnt FROM messages WHERE source = 'twitter' AND content_type != 'dm'`).get() as { cnt: number }).cnt
-      if (postMessages !== preCounts.messages) {
-        throw new Error(`Message count changed! Before: ${preCounts.messages}, After: ${postMessages}. Rolling back.`)
-      }
-
-      // Verify no orphaned messages
-      const orphans = (db.query(`SELECT COUNT(*) as cnt FROM messages WHERE thread_id NOT IN (SELECT id FROM threads)`).get() as { cnt: number }).cnt
-      if (orphans > 0) {
-        throw new Error(`Found ${orphans} orphaned messages. Rolling back.`)
-      }
-
-      db.exec('COMMIT')
-    }
-
-    console.log(`  Chains found: ${formatNumber(phase1.chainsFound)}`)
-    console.log(`  Messages moved: ${formatNumber(phase1.messagesMoved)}`)
-    console.log()
-
-  } catch (err) {
-    if (!dryRun) db.exec('ROLLBACK')
-    console.error(`Phase 1 failed: ${err}`)
-    db.close()
-    process.exit(1)
-  }
-
-  // Phase 2: Add parent tweet stubs
-  console.log('--- Phase 2: Add parent tweet stubs ---')
-  if (!dryRun) db.exec('BEGIN TRANSACTION')
-
-  // Load like index for hydrating stubs with actual tweet text
-  let likeIndex: Map<string, string> | undefined
-  try {
-    const config = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
-    const archivePath = config.extraction?.twitter?.archive_path
-    if (archivePath && existsSync(archivePath)) {
-      likeIndex = loadLikeIndex(archivePath)
-    }
-  } catch { /* config not available, proceed without like index */ }
-
-  try {
-    const phase2 = addParentTweetStubs(db, { dryRun, likeIndex })
-
-    if (!dryRun) {
-      // Verify no orphaned messages
-      const orphans = (db.query(`SELECT COUNT(*) as cnt FROM messages WHERE thread_id NOT IN (SELECT id FROM threads)`).get() as { cnt: number }).cnt
-      if (orphans > 0) {
-        throw new Error(`Found ${orphans} orphaned messages after Phase 2. Rolling back.`)
-      }
-
-      db.exec('COMMIT')
-    }
-
-    console.log(`  Stubs created: ${formatNumber(phase2.stubsCreated)}`)
-    console.log(`  People created: ${formatNumber(phase2.peopleCreated)}`)
-    console.log()
-
-  } catch (err) {
-    if (!dryRun) db.exec('ROLLBACK')
-    console.error(`Phase 2 failed: ${err}`)
-    db.close()
-    process.exit(1)
-  }
-
-  // Post-migration counts
-  if (!dryRun) {
-    const postCounts = {
-      threads: (db.query(`SELECT COUNT(*) as cnt FROM threads WHERE source = 'twitter'`).get() as { cnt: number }).cnt,
-      messages: (db.query(`SELECT COUNT(*) as cnt FROM messages WHERE source = 'twitter' AND content_type != 'dm'`).get() as { cnt: number }).cnt,
-      multiTweetThreads: (db.query(`SELECT COUNT(*) as cnt FROM threads WHERE source = 'twitter' AND thread_type = 'thread'`).get() as { cnt: number }).cnt,
-    }
-
-    console.log('Post-migration counts:')
-    console.log(`  Threads: ${formatNumber(postCounts.threads)} (was ${formatNumber(preCounts.threads)})`)
-    console.log(`  Messages: ${formatNumber(postCounts.messages)} (was ${formatNumber(preCounts.messages)})`)
-    console.log(`  Multi-tweet threads: ${formatNumber(postCounts.multiTweetThreads)}`)
-  }
-
-  db.close()
-}
-
-// Hydrate existing placeholder stubs with actual tweet text from like.js
-async function cmdHydrateTwitterStubs(args: ParsedArgs): Promise<void> {
-  const dryRun = !!args.flags['dry-run']
-  const db = getDb()
-
-  // Load config for archive path
-  const config = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
-  const archivePath = config.extraction?.twitter?.archive_path
-
-  if (!archivePath || !existsSync(archivePath)) {
-    console.error('Error: Twitter archive path not configured or not found')
-    db.close()
-    process.exit(1)
-  }
-
-  console.log('=== Hydrate Twitter Parent Stubs from like.js ===')
-  console.log(`Mode: ${dryRun ? 'DRY RUN' : 'LIVE'}`)
-  console.log()
-
-  // Backup DB before modification
-  if (!dryRun) {
-    const backupPath = DB_PATH.replace('.db', `-backup-hydrate-${new Date().toISOString().replace(/[:.]/g, '-')}.db`)
-    copyFileSync(DB_PATH, backupPath)
-    console.log(`Database backed up to: ${backupPath}`)
-    console.log()
-  }
-
-  // Load like index
-  const likeIndex = loadLikeIndex(archivePath)
-  if (likeIndex.size === 0) {
-    console.log('No liked tweets found. Nothing to hydrate.')
-    db.close()
-    return
-  }
-
-  // Find placeholder stubs
-  const stubs = db.query(`
-    SELECT id, content FROM messages
-    WHERE source = 'twitter'
-      AND is_from_me = 0
-      AND content LIKE '%content not available%'
-  `).all() as Array<{ id: string; content: string }>
-
-  console.log(`Found ${formatNumber(stubs.length)} placeholder stubs`)
-
-  let hydrated = 0
-  let noMatch = 0
-  const samples: Array<{ id: string; oldContent: string; newContent: string }> = []
-
-  if (!dryRun) db.exec('BEGIN TRANSACTION')
-
-  try {
-    for (const stub of stubs) {
-      const tweetId = stub.id.replace('twitter:', '')
-      const likedText = likeIndex.get(tweetId)
-
-      if (likedText) {
-        const wordCount = likedText.split(/\s+/).length
-        if (!dryRun) {
-          db.query(`UPDATE messages SET content = ?, word_count = ? WHERE id = ?`).run(likedText, wordCount, stub.id)
-        }
-        hydrated++
-        if (samples.length < 10) {
-          samples.push({ id: stub.id, oldContent: stub.content, newContent: likedText })
-        }
-      } else {
-        noMatch++
-      }
-    }
-
-    if (!dryRun) db.exec('COMMIT')
-  } catch (err) {
-    if (!dryRun) db.exec('ROLLBACK')
-    console.error(`Hydration failed: ${err}`)
-    db.close()
-    process.exit(1)
-  }
-
-  console.log()
-  console.log(`Results:`)
-  console.log(`  Stubs hydrated: ${formatNumber(hydrated)}`)
-  console.log(`  No match in likes: ${formatNumber(noMatch)}`)
-  console.log(`  Hit rate: ${stubs.length > 0 ? ((hydrated / stubs.length) * 100).toFixed(1) : 0}%`)
-
-  if (samples.length > 0) {
-    console.log()
-    console.log(`Sample hydrations (up to 10):`)
-    for (const s of samples) {
-      console.log(`  ${s.id}:`)
-      console.log(`    Was: ${s.oldContent.substring(0, 80)}...`)
-      console.log(`    Now: ${s.newContent.substring(0, 120)}${s.newContent.length > 120 ? '...' : ''}`)
-    }
-  }
-
-  db.close()
 }
 
 // ============================================================
@@ -5895,9 +5541,12 @@ function createSourcePersonId(displayName: string, source: 'calls' | 'beeper' | 
 async function cmdEnrich(args: ParsedArgs): Promise<void> {
   const limit = args.flags.limit as number | undefined
   const sourceFilter = args.flags.source as string | undefined
-  const fromDate = args.flags.from as string | undefined
-  const toDate = args.flags.to as string | undefined
+  // --extracted-since is a deprecated alias for --from. It used to filter on threads.extracted_at,
+  // which is only set on insert, so new replies in existing threads were silently skipped.
   const extractedSince = args.flags['extracted-since'] as string | undefined
+  const fromDate = (args.flags.from as string | undefined)
+    ?? extractedSince?.replace('T', ' ').replace('Z', '').replace(/\.\d+$/, '')
+  const toDate = args.flags.to as string | undefined
   const dryRun = args.flags['dry-run']
   const debug = args.flags.debug
 
@@ -5907,14 +5556,12 @@ async function cmdEnrich(args: ParsedArgs): Promise<void> {
     const env = await load_env()
     if (!(env.GEMINI_API_KEY || process.env.GEMINI_API_KEY)) {
       console.log('Enrichment skipped: no GEMINI_API_KEY in tools/.env (enrichment is optional).')
-      console.log('Add one from https://aistudio.google.com/apikey to enable quality/topic/sentiment metadata.')
+      console.log('Add one from https://aistudio.google.com/apikey to enable quality/authorship/topic metadata.')
       return
     }
   }
-  if (extractedSince) {
-    console.warn('Note: --extracted-since only sees brand-new threads (threads.extracted_at is set on insert,')
-    console.warn('never on update), and new threads are usually inbound-only. Prefer --from <date>, which')
-    console.warn("filters on last_activity_at and so catches new replies in existing threads too.")
+  if (extractedSince && !args.flags.from) {
+    console.warn('Note: --extracted-since is deprecated; treating it as --from (threads active since that date).')
   }
 
   const db = getDb()
@@ -5926,35 +5573,7 @@ async function cmdEnrich(args: ParsedArgs): Promise<void> {
   )
   console.log(`Already enriched: ${formatNumber(enrichedIds.size)} messages`)
 
-  // Find threads where the owner has at least one unenriched message
-  // Use a simpler query that doesn't require correlated subqueries
-  let query = `
-    SELECT t.id as thread_id, t.source, t.title, t.subject,
-           t.message_count as total_messages,
-           t.my_message_count,
-           t.last_activity_at
-    FROM threads t
-    WHERE t.my_message_count > 0
-  `
-  const params: any[] = []
-
-  if (sourceFilter) {
-    query += ` AND t.source = ?`
-    params.push(sourceFilter)
-  }
-
-  if (fromDate) {
-    query += ` AND t.last_activity_at >= ?`
-    params.push(fromDate)
-  }
-
-  if (toDate) {
-    query += ` AND t.last_activity_at < ?`
-    params.push(toDate)
-  }
-
-  query += ` ORDER BY t.last_activity_at DESC`
-
+  // Find threads where the owner has at least one unenriched message.
   // Optimized: Use a single SQL query to find threads with unenriched messages
   // This avoids O(n) queries by joining with messages and checking enrichment status in SQL
   let optimizedQuery = `
@@ -5984,13 +5603,6 @@ async function cmdEnrich(args: ParsedArgs): Promise<void> {
   if (toDate) {
     optimizedQuery += ` AND t.last_activity_at < ?`
     optimizedParams.push(toDate)
-  }
-
-  if (extractedSince) {
-    // Normalize ISO 8601 (2026-03-27T16:00:00Z) to SQLite datetime format (2026-03-27 16:00:00)
-    const normalizedSince = extractedSince.replace('T', ' ').replace('Z', '').replace(/\.\d+$/, '')
-    optimizedQuery += ` AND t.extracted_at >= ?`
-    optimizedParams.push(normalizedSince)
   }
 
   optimizedQuery += ` GROUP BY t.id ORDER BY t.last_activity_at DESC`
@@ -6229,10 +5841,6 @@ async function enrichThread(
   let totalPromptTokens = 0
   let totalOutputTokens = 0
   let enriched = 0
-  const allResponses: Array<{
-    thread_analysis: any
-    messages: any[]
-  }> = []
 
   for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
     const batchIds = batches[batchIdx]
@@ -6330,19 +5938,16 @@ async function enrichThread(
     // Unique-per-batch schema files would otherwise pile up in debug/.
     try { unlinkSync(schemaPath) } catch { /* already gone — fine */ }
 
-    allResponses.push(batchResponse)
-
     // Write this batch's rows now. A 66-batch thread used to hold everything in memory
     // and write once at the end — an OOM kill at batch 39 (2026-09-10) lost all of it.
-    enriched += storeBatch(batchResponse, allResponses[0]?.thread_analysis || {})
+    enriched += storeBatch(batchResponse)
   }
 
   // Use token counts from batches
   const promptTokens = totalPromptTokens
   const outputTokens = totalOutputTokens
-  const threadAnalysis = allResponses[0]?.thread_analysis || {}
 
-  function storeBatch(response: { messages: any[] }, threadAnalysis: any): number {
+  function storeBatch(response: { messages: any[] }): number {
     let n = 0
     for (const msgMeta of response.messages ?? []) {
     if (!unenrichedIds.includes(msgMeta.message_id)) {
@@ -6350,31 +5955,19 @@ async function enrichThread(
       continue
     }
 
-    // Consolidated schema - 10 fields instead of 35
+    // Explicit column list: works on both new (slim) and older (wider) message_metadata tables.
     db.query(`
       INSERT OR REPLACE INTO message_metadata (
-        message_id,
-        quality_score, authorship_score, originality_score,
-        topics, domain, sentiment, engagement, actionability,
-        entities, style_tags, thread_role, relationship_dynamic,
-        processed_at, processor_model
-      ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?
-      )
+        message_id, quality_score, authorship_score, originality_score,
+        topics, entities, processed_at, processor_model
+      ) VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?)
     `).run(
       msgMeta.message_id,
       msgMeta.quality_score ?? null,
       msgMeta.authorship_score ?? null,
       msgMeta.originality_score ?? null,
       msgMeta.topics ? JSON.stringify(msgMeta.topics) : null,
-      msgMeta.domain ?? null,
-      msgMeta.sentiment ?? null,
-      msgMeta.engagement ?? null,
-      msgMeta.actionability ?? null,
       msgMeta.entities ? JSON.stringify(msgMeta.entities) : null,
-      msgMeta.style_tags ? JSON.stringify(msgMeta.style_tags) : null,
-      msgMeta.thread_role ?? null,
-      threadAnalysis.relationship_dynamic ?? null,
       enrichModel()
     )
 
@@ -6382,21 +5975,6 @@ async function enrichThread(
     }
     return n
   }
-
-  // Update thread with enrichment analysis
-  db.query(`
-    UPDATE threads SET
-      enriched_topic = ?,
-      enriched_type = ?,
-      enriched_relationship = ?,
-      enriched_at = datetime('now')
-    WHERE id = ?
-  `).run(
-    threadAnalysis.thread_topic ?? null,
-    threadAnalysis.thread_type ?? null,
-    threadAnalysis.relationship_dynamic ?? null,
-    threadId
-  )
 
   console.log(`  Enriched ${enriched} messages (${promptTokens} in, ${outputTokens} out tokens)`)
   return { messagesEnriched: enriched, promptTokens, outputTokens }
@@ -6426,47 +6004,31 @@ function resolveEnrichModel(): string {
   return DEFAULT_ENRICH_MODEL
 }
 
-// Consolidated schema: ~10 fields instead of ~35
-// Uses scores (0-1 or 1-7) instead of booleans for richer data
+// Enrichment schema (2026-10 slim): only the fields something actually reads.
+//   quality/originality -> extract-for-summary's low-quality + AI-written filters
+//   authorship          -> "did the owner write this" (writing-sample curation, ad-hoc SQL)
+//   topics/entities     -> the most-queried descriptive fields
+// Older DBs may still carry domain/sentiment/engagement/actionability/style_tags/
+// thread_role/relationship_dynamic (and threads.enriched_*). They are left in place
+// and simply no longer written.
 function buildThreadEnrichmentSchema(_messageIds: string[]): object {
   return {
     type: "object",
-    required: ["thread_analysis", "messages"],
+    required: ["messages"],
     properties: {
-      thread_analysis: {
-        type: "object",
-        required: ["thread_topic", "thread_type", "relationship_dynamic"],
-        properties: {
-          thread_topic: { type: "string", description: "Main topic of the thread" },
-          thread_type: {
-            type: "string",
-            enum: ["question", "discussion", "coordination", "broadcast", "support", "sales", "interview", "other"]
-          },
-          relationship_dynamic: {
-            type: "string",
-            enum: ["peer", "mentor", "mentee", "customer", "provider", "collaborator", "stranger", "family", "friend"]
-          }
-        }
-      },
       messages: {
         type: "array",
         description: "One entry per [MSG n] marker, in order",
         items: {
           type: "object",
-          required: ["msg_index", "quality_score", "authorship_score", "originality_score", "topics", "domain", "sentiment", "engagement", "actionability", "entities", "style_tags", "thread_role"],
+          required: ["msg_index", "quality_score", "authorship_score", "originality_score", "topics", "entities"],
           properties: {
             msg_index: { type: "integer", description: "The n from the [MSG n] marker" },
             quality_score: { type: "integer", description: "Overall quality 1-7 (whole number): voice, insight, craft. 1=filler, 4=solid, 7=exceptional" },
             authorship_score: { type: "number", description: "Confidence 0-1 that the owner wrote this themselves (vs quoted/forwarded/pasted/LLM-generated text)" },
             originality_score: { type: "integer", description: "Intellectual originality 1-7 (whole number): 1=common wisdom, 4=thoughtful, 7=unique insight" },
             topics: { type: "array", items: { type: "string" }, description: "1-3 lowercase topic tags; reuse the same tag for the same concept across messages" },
-            domain: { type: "string", enum: ["ai", "business", "personal", "podcast", "health", "technical", "other"] },
-            sentiment: { type: "number", description: "Sentiment -1 to 1: negative to positive" },
-            engagement: { type: "integer", description: "Energy/emotion level 1-7 (whole number): 1=low-key, 4=engaged, 7=highly passionate" },
-            actionability: { type: "integer", description: "Decisions/commitments/action items 1-7 (whole number): 1=pure info, 7=highly actionable" },
-            entities: { type: "array", items: { type: "string" }, description: "Named people, companies, products that appear in THIS message's own text. Empty array if none." },
-            style_tags: { type: "array", items: { type: "string" }, description: "Style markers from: formal, casual, technical, humor, emphatic, lists, links, terse, long-form" },
-            thread_role: { type: "string", enum: ["initiator", "responder"], description: "initiator = this message opens the thread or re-opens it after a gap; responder = replies to the other party's preceding message" }
+            entities: { type: "array", items: { type: "string" }, description: "Named people, companies, products that appear in THIS message's own text. Empty array if none." }
           }
         }
       }
@@ -6501,50 +6063,14 @@ SCORING GUIDELINES:
 2. authorship_score (0-1): confidence the owner wrote this themselves. Lower it for quoted text, forwarded content, pasted links/articles, boilerplate, or LLM-sounding prose.
 3. originality_score (1-7, whole number): intellectual uniqueness. 1=common wisdom, 4=thoughtful, 7=few would say this.
 4. topics: 1-3 lowercase tags, specific but not granular. REUSE the same tag for the same concept across messages (e.g. always "project scheduling", not "scheduling"/"project booking"/"scheduling confirmation"). Do not put names of people/companies/products in topics — those go in entities.
-5. domain: primary domain (ai, business, personal, podcast, health, technical, other).
-6. sentiment (-1 to 1): negative to positive tone of THIS message.
-7. engagement (1-7, whole number): energy/emotion level. 1=low-key, 4=engaged, 7=highly passionate.
-8. actionability (1-7, whole number): decisions, commitments, requests, action items. 1=pure info/chatter, 4=a concrete ask or plan, 7=firm commitment or decision with next steps.
-9. entities: ONLY named people, companies, products, or organizations that appear in THIS message's own text (or an explicit @-mention / obvious nickname for a participant). Do NOT carry over entities from the thread title, from other people's messages, or from the owner's other messages. Do NOT list generic concepts ("AI", "agents", "startups"). An empty array is the correct answer for a message that names nothing.
-10. style_tags: pick from formal, casual, technical, humor, emphatic, lists, links, terse, long-form.
-11. thread_role: "initiator" if the message opens the thread or re-opens it after a gap; "responder" if it replies to the other party's preceding message.
+5. entities: ONLY named people, companies, products, or organizations that appear in THIS message's own text (or an explicit @-mention / obvious nickname for a participant). Do NOT carry over entities from the thread title, from other people's messages, or from the owner's other messages. Do NOT list generic concepts ("AI", "agents", "startups"). An empty array is the correct answer for a message that names nothing.
 
 CONVERSATION:
 ---
 ${threadContext}
 ---
 
-Analyze the ${n} message(s) marked [MSG n] and return the structured metadata. For thread_analysis, consider the overall conversation.`
-}
-
-async function cmdSynthesize(args: ParsedArgs): Promise<void> {
-  const type = args.positional[0] as SynthesisType
-
-  if (!type) {
-    console.error('Error: Synthesis type required')
-    console.error('Usage: deep-context synthesize <type>')
-    console.error(`Valid types: ${SYNTHESIS_TYPES.join(', ')}`)
-    process.exit(1)
-  }
-
-  if (!SYNTHESIS_TYPES.includes(type as SynthesisType)) {
-    console.error(`Error: Invalid synthesis type "${type}"`)
-    console.error(`Valid types: ${SYNTHESIS_TYPES.join(', ')}`)
-    process.exit(1)
-  }
-
-  const personId = args.flags.person as string | undefined
-  const projectId = args.flags.project as string | undefined
-  const force = args.flags.force
-
-  console.log(`Generating synthesis: ${type}`)
-  if (personId) console.log(`  Person: ${personId}`)
-  if (projectId) console.log(`  Project: ${projectId}`)
-  if (force) console.log(`  [FORCE]`)
-
-  // Placeholder - actual synthesis logic will use Gemini
-  console.log('\nSynthesis not yet implemented.')
-  console.log('Will use Gemini 3 Pro for generation.')
+Analyze the ${n} message(s) marked [MSG n] and return the structured metadata.`
 }
 
 async function cmdQuery(args: ParsedArgs): Promise<void> {
@@ -6714,12 +6240,11 @@ async function cmdTodo(args: ParsedArgs): Promise<void> {
         process.exit(1)
       }
 
-      const sourceMessageId = args.flags['source-message-id'] as string || ''
       const normalizedTitle = title.toLowerCase().replace(/\s+/g, ' ').trim().substring(0, 100)
 
       // Use Bun's built-in hashing for deterministic ID
       const hasher = new Bun.CryptoHasher('sha256')
-      hasher.update(sourceMessageId ? `${sourceMessageId}|${normalizedTitle}` : `manual|${normalizedTitle}|${new Date().toISOString().split('T')[0]}`)
+      hasher.update(`manual|${normalizedTitle}|${new Date().toISOString().split('T')[0]}`)
       const id = hasher.digest('hex').substring(0, 16)
 
       const result = db.query(`INSERT OR IGNORE INTO todo_items (id, category, title, context, source, source_message_id, source_thread_id, source_url, due_date, priority, related_person, tags, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`).run(
@@ -6728,9 +6253,7 @@ async function cmdTodo(args: ParsedArgs): Promise<void> {
         title,
         (args.flags.context as string) || null,
         source,
-        sourceMessageId || null,
-        (args.flags['source-thread-id'] as string) || null,
-        (args.flags['source-url'] as string) || null,
+        null, null, null,  // source_message_id/thread_id/url: kept in the schema, no longer set
         (args.flags.due as string) || null,
         (args.flags.priority as string) || 'normal',
         (args.flags['related-person'] as string) || null,
@@ -6936,27 +6459,6 @@ async function cmdTodo(args: ParsedArgs): Promise<void> {
   }
 }
 
-async function cmdExport(args: ParsedArgs): Promise<void> {
-  const type = args.positional[0]
-  const outputPath = args.flags.output as string | undefined
-  const format = (args.flags.format as string) || 'json'
-
-  if (!type) {
-    console.error('Error: Export type required')
-    console.error('Usage: deep-context export <type> --output FILE')
-    console.error('Valid types: messages, people, syntheses')
-    process.exit(1)
-  }
-
-  if (!outputPath) {
-    console.error('Error: Output path required (--output)')
-    process.exit(1)
-  }
-
-  console.log(`Exporting ${type} to ${outputPath} (${format})`)
-  console.log('\nExport not yet implemented.')
-}
-
 // ============================================================
 // EXPORT-PUBLIC - Build a public-only DB (default: podcast + own tweets) with
 // FTS5, and optionally scp it to another machine for low-access agents.
@@ -7133,124 +6635,6 @@ async function cmdExportPublic(args: ParsedArgs): Promise<void> {
   }
 }
 
-async function cmdUpdate(args: ParsedArgs): Promise<void> {
-  const dryRun = args.flags['dry-run']
-
-  console.log('Running incremental update...')
-  if (dryRun) console.log('  [DRY RUN]')
-
-  console.log('\n1. Extracting new items from all sources...')
-  console.log('2. Enriching new messages...')
-  console.log('3. Updating affected syntheses...')
-
-  console.log('\nIncremental update not yet implemented.')
-}
-
-// ============================================================
-// PATCH HTML EMAILS - Convert existing HTML content to plain text
-// ============================================================
-
-async function cmdPatchHtmlEmails(args: ParsedArgs): Promise<void> {
-  const dryRun = args.flags['dry-run']
-  const limit = args.flags.limit ? parseInt(args.flags.limit as string, 10) : undefined
-
-  console.log('=== Patch HTML Emails ===')
-  if (dryRun) console.log('[DRY RUN]')
-
-  const db = getDb()
-
-  try {
-    // Find messages with HTML content patterns
-    // These are the indicators that the content is raw HTML that wasn't properly converted
-    const query = `
-      SELECT id, content
-      FROM messages
-      WHERE source = 'gmail'
-        AND (
-          content LIKE '<!DOCTYPE%'
-          OR content LIKE '<html%'
-          OR content LIKE '%<table%'
-          OR content LIKE '%<style%'
-          OR content LIKE '%<div %'
-          OR content LIKE '%<td%'
-          OR content LIKE '%<tr%'
-        )
-      ${limit ? `LIMIT ${limit}` : ''}
-    `
-
-    const htmlMessages = db.query(query).all() as Array<{ id: string; content: string }>
-
-    console.log(`Found ${formatNumber(htmlMessages.length)} messages with HTML content`)
-
-    if (htmlMessages.length === 0) {
-      console.log('No HTML emails to patch.')
-      return
-    }
-
-    let patched = 0
-    let errors = 0
-
-    for (const msg of htmlMessages) {
-      try {
-        const cleanContent = convertHtmlToText(msg.content)
-
-        // Only update if the conversion actually changed the content
-        // and produced meaningful text (not just whitespace)
-        if (cleanContent !== msg.content && cleanContent.trim().length > 10) {
-          if (!dryRun) {
-            db.query(`
-              UPDATE messages
-              SET content = ?, word_count = ?
-              WHERE id = ?
-            `).run(
-              cleanContent,
-              cleanContent.split(/\s+/).filter(Boolean).length,
-              msg.id
-            )
-          }
-          patched++
-
-          if (patched <= 3 || (patched % 100 === 0)) {
-            console.log(`\n--- Example ${patched}: ${msg.id} ---`)
-            console.log(`Before (${msg.content.length} chars): ${msg.content.slice(0, 100)}...`)
-            console.log(`After (${cleanContent.length} chars): ${cleanContent.slice(0, 100)}...`)
-          }
-        }
-      } catch (err) {
-        errors++
-        if (errors <= 5) {
-          console.error(`Error processing ${msg.id}: ${(err as Error).message}`)
-        }
-      }
-
-      if (patched > 0 && patched % 100 === 0) {
-        console.log(`Progress: ${formatNumber(patched)} patched...`)
-      }
-    }
-
-    console.log(`\n=== Summary ===`)
-    console.log(`Patched: ${formatNumber(patched)}`)
-    console.log(`Errors: ${formatNumber(errors)}`)
-    if (dryRun) {
-      console.log('(Dry run - no changes written)')
-    }
-
-    // Verify no HTML remains
-    if (!dryRun && patched > 0) {
-      const remainingHtml = db.query(`
-        SELECT COUNT(*) as count
-        FROM messages
-        WHERE source = 'gmail'
-          AND content LIKE '<!DOCTYPE%'
-      `).get() as { count: number }
-
-      console.log(`Remaining <!DOCTYPE emails: ${remainingHtml.count}`)
-    }
-  } finally {
-    db.close()
-  }
-}
-
 // ============================================================
 // BACKFILL - Checkpointed historical backfill for Slack sources
 // ============================================================
@@ -7365,272 +6749,6 @@ async function cmdBackfill(args: ParsedArgs): Promise<void> {
 }
 
 // ============================================================
-// PATCH SLACK MENTIONS - Resolve <@U12345> to @DisplayName in existing messages
-// ============================================================
-
-async function cmdPatchSlackMentions(args: ParsedArgs): Promise<void> {
-  const dryRun = args.flags['dry-run']
-  const limit = args.flags.limit ? parseInt(args.flags.limit as string, 10) : undefined
-
-  console.log('=== Patch Slack Mentions ===')
-  if (dryRun) console.log('[DRY RUN]')
-
-  const db = getDb()
-
-  try {
-    // Find messages with unresolved Slack user mentions
-    const query = `
-      SELECT id, content, source
-      FROM messages
-      WHERE source IN ('slack', 'slack-dm')
-        AND content LIKE '%<@U%'
-      ${limit ? `LIMIT ${limit}` : ''}
-    `
-
-    const mentionMessages = db.query(query).all() as Array<{ id: string; content: string; source: string }>
-
-    console.log(`Found ${formatNumber(mentionMessages.length)} messages with unresolved mentions`)
-
-    if (mentionMessages.length === 0) {
-      console.log('No Slack mentions to patch.')
-      return
-    }
-
-    // Determine workspace from message ID (format: slack:workspace:... or slack-dm:workspace:...)
-    let patched = 0
-    let unchanged = 0
-    let errors = 0
-
-    for (const msg of mentionMessages) {
-      try {
-        // Extract workspace from message ID: "slack:workspace:..." or "slack-dm:workspace:..."
-        const parts = msg.id.split(':')
-        const workspace = parts[1] // e.g. the workspace flag
-
-        const resolved = resolveSlackMentions(db, msg.content, workspace)
-
-        if (resolved !== msg.content) {
-          if (!dryRun) {
-            db.query(`
-              UPDATE messages
-              SET content = ?, word_count = ?
-              WHERE id = ?
-            `).run(
-              resolved,
-              resolved.split(/\s+/).filter(Boolean).length,
-              msg.id
-            )
-          }
-          patched++
-
-          if (patched <= 3) {
-            console.log(`\n--- Example ${patched}: ${msg.id} ---`)
-            console.log(`Before: ${msg.content.slice(0, 150)}`)
-            console.log(`After:  ${resolved.slice(0, 150)}`)
-          }
-        } else {
-          unchanged++
-        }
-      } catch (err) {
-        errors++
-        if (errors <= 5) {
-          console.error(`Error processing ${msg.id}: ${(err as Error).message}`)
-        }
-      }
-
-      if ((patched + unchanged) % 500 === 0 && (patched + unchanged) > 0) {
-        console.log(`Progress: ${formatNumber(patched)} patched, ${formatNumber(unchanged)} unchanged...`)
-      }
-    }
-
-    console.log(`\n=== Summary ===`)
-    console.log(`Patched: ${formatNumber(patched)}`)
-    console.log(`Unchanged (user ID not in cache): ${formatNumber(unchanged)}`)
-    console.log(`Errors: ${formatNumber(errors)}`)
-    if (dryRun) console.log('(Dry run - no changes written)')
-
-    // Show remaining unresolved
-    if (!dryRun) {
-      const remaining = db.query(`
-        SELECT COUNT(*) as count
-        FROM messages
-        WHERE source IN ('slack', 'slack-dm') AND content LIKE '%<@U%'
-      `).get() as { count: number }
-      console.log(`Remaining unresolved mentions: ${remaining.count}`)
-    }
-  } finally {
-    db.close()
-  }
-}
-
-// ============================================================
-// DEDUP BEEPER IMESSAGE - Remove beeper dupes of native imessage records
-// ============================================================
-
-async function cmdDedupBeeperImessage(args: ParsedArgs): Promise<void> {
-  const dryRun = !!args.flags['dry-run']
-
-  console.log('\n=== Dedup Beeper iMessage ===')
-  if (dryRun) console.log('[DRY RUN]\n')
-
-  const db = getDb()
-
-  try {
-    // Pre-dedup counts
-    const beeperImsgMessages = (db.query(`
-      SELECT COUNT(*) as cnt FROM messages
-      WHERE source = 'beeper' AND thread_id LIKE 'beeper:imsg%'
-    `).get() as { cnt: number }).cnt
-
-    const beeperImsgThreads = (db.query(`
-      SELECT COUNT(*) as cnt FROM threads
-      WHERE source = 'beeper' AND id LIKE 'beeper:imsg%'
-    `).get() as { cnt: number }).cnt
-
-    const nativeImsgMessages = (db.query(`
-      SELECT COUNT(*) as cnt FROM messages WHERE source = 'imessage'
-    `).get() as { cnt: number }).cnt
-
-    // Find duplicates: beeper iMessage messages whose UUID exists in native imessage
-    const duplicateCount = (db.query(`
-      SELECT COUNT(*) as cnt FROM messages
-      WHERE source = 'beeper'
-        AND thread_id LIKE 'beeper:imsg%'
-        AND source_message_id IN (
-          SELECT source_message_id FROM messages WHERE source = 'imessage'
-        )
-    `).get() as { cnt: number }).cnt
-
-    const uniqueCount = beeperImsgMessages - duplicateCount
-
-    console.log('Pre-dedup state:')
-    console.log(`  Beeper iMessage threads: ${formatNumber(beeperImsgThreads)}`)
-    console.log(`  Beeper iMessage messages: ${formatNumber(beeperImsgMessages)}`)
-    console.log(`  Native imessage messages: ${formatNumber(nativeImsgMessages)}`)
-    console.log(`  Duplicates (same UUID): ${formatNumber(duplicateCount)}`)
-    console.log(`  Genuinely new messages: ${formatNumber(uniqueCount)}`)
-    console.log()
-
-    if (duplicateCount === 0) {
-      console.log('No duplicates found. Nothing to do.')
-      return
-    }
-
-    if (!dryRun) {
-      // Back up database
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
-      const backupPath = `${DB_PATH}.bak-${timestamp}`
-      copyFileSync(DB_PATH, backupPath)
-      console.log(`Database backed up to: ${backupPath}`)
-      console.log()
-
-      db.exec('BEGIN TRANSACTION')
-    }
-
-    try {
-      // Step 1: Delete duplicate beeper iMessage messages
-      console.log('Step 1: Removing duplicate beeper iMessage messages...')
-      if (!dryRun) {
-        const deleteResult = db.query(`
-          DELETE FROM messages
-          WHERE source = 'beeper'
-            AND thread_id LIKE 'beeper:imsg%'
-            AND source_message_id IN (
-              SELECT source_message_id FROM messages WHERE source = 'imessage'
-            )
-        `).run()
-        console.log(`  Deleted ${formatNumber(deleteResult.changes)} duplicate messages`)
-      } else {
-        console.log(`  Would delete ${formatNumber(duplicateCount)} duplicate messages`)
-      }
-
-      // Step 2: Delete beeper iMessage threads with no remaining messages
-      console.log('\nStep 2: Removing empty beeper iMessage threads...')
-      const emptyThreads = db.query(`
-        SELECT id FROM threads
-        WHERE source = 'beeper' AND id LIKE 'beeper:imsg%'
-          AND id NOT IN (SELECT DISTINCT thread_id FROM messages WHERE source = 'beeper')
-      `).all() as Array<{ id: string }>
-
-      if (!dryRun) {
-        for (const t of emptyThreads) {
-          db.query(`DELETE FROM threads WHERE id = ?`).run(t.id)
-        }
-      }
-      console.log(`  ${dryRun ? 'Would remove' : 'Removed'} ${formatNumber(emptyThreads.length)} empty threads`)
-
-      // Step 3: Update counts for remaining beeper iMessage threads
-      const remainingThreads = db.query(`
-        SELECT id FROM threads
-        WHERE source = 'beeper' AND id LIKE 'beeper:imsg%'
-          AND id NOT IN (${emptyThreads.map(() => '?').join(',') || "'__none__'"})
-      `).all(...emptyThreads.map(t => t.id)) as Array<{ id: string }>
-
-      console.log(`\nStep 3: Updating counts for ${formatNumber(remainingThreads.length)} remaining threads...`)
-      if (!dryRun) {
-        for (const t of remainingThreads) {
-          db.query(`
-            UPDATE threads SET
-              message_count = (SELECT COUNT(*) FROM messages WHERE thread_id = ?),
-              my_message_count = (SELECT COUNT(*) FROM messages WHERE thread_id = ? AND is_from_me = 1)
-            WHERE id = ?
-          `).run(t.id, t.id, t.id)
-        }
-      }
-
-      // Step 4: Clean up orphaned message_metadata
-      console.log('\nStep 4: Cleaning orphaned message_metadata...')
-      const orphanedMetadata = (db.query(`
-        SELECT COUNT(*) as cnt FROM message_metadata
-        WHERE message_id NOT IN (SELECT id FROM messages)
-      `).get() as { cnt: number }).cnt
-
-      if (orphanedMetadata > 0 && !dryRun) {
-        const metaResult = db.query(`
-          DELETE FROM message_metadata
-          WHERE message_id NOT IN (SELECT id FROM messages)
-        `).run()
-        console.log(`  Deleted ${formatNumber(metaResult.changes)} orphaned metadata records`)
-      } else {
-        console.log(`  ${orphanedMetadata > 0 ? `Would delete ${formatNumber(orphanedMetadata)}` : 'No'} orphaned metadata records`)
-      }
-
-      if (!dryRun) {
-        db.exec('COMMIT')
-      }
-
-      // Post-dedup verification
-      console.log('\n=== Post-dedup Verification ===')
-      const postBeeperImsg = (db.query(`
-        SELECT COUNT(*) as cnt FROM messages
-        WHERE source = 'beeper' AND thread_id LIKE 'beeper:imsg%'
-      `).get() as { cnt: number }).cnt
-
-      const postBeeperImsgThreads = (db.query(`
-        SELECT COUNT(*) as cnt FROM threads
-        WHERE source = 'beeper' AND id LIKE 'beeper:imsg%'
-      `).get() as { cnt: number }).cnt
-
-      const postNativeImsg = (db.query(`
-        SELECT COUNT(*) as cnt FROM messages WHERE source = 'imessage'
-      `).get() as { cnt: number }).cnt
-
-      console.log(`  Beeper iMessage threads: ${formatNumber(beeperImsgThreads)} → ${formatNumber(postBeeperImsgThreads)}`)
-      console.log(`  Beeper iMessage messages: ${formatNumber(beeperImsgMessages)} → ${formatNumber(postBeeperImsg)}`)
-      console.log(`  Native imessage messages: ${formatNumber(postNativeImsg)} (unchanged)`)
-
-      if (dryRun) console.log('\n(Dry run — no changes written)')
-
-    } catch (err) {
-      if (!dryRun) db.exec('ROLLBACK')
-      throw err
-    }
-  } finally {
-    db.close()
-  }
-}
-
-// ============================================================
 // EXTRACT FOR SUMMARY - Thread-centric extraction for LLM summarization
 // ============================================================
 
@@ -7717,7 +6835,7 @@ async function cmdExtractForSummary(args: ParsedArgs): Promise<void> {
     fromDate,
     toDate,
     tokenBudget: parseInt(args.flags['token-budget'] as string, 10) || 300000,
-    overlapMessages: parseInt(args.flags.overlap as string, 10) || 0,
+    overlapMessages: 0,  // windowed-thread overlap (the --overlap flag was never used)
     includeLowQuality: !!args.flags['include-low-quality'],
     outputPath: args.flags.output as string | undefined
   }
@@ -9097,2180 +8215,6 @@ async function extractPodcastSection(db: Database, config: ExtractConfig): Promi
 }
 
 // ============================================================
-// CONTACTS COMMAND
-// ============================================================
-
-async function cmdContacts(args: ParsedArgs): Promise<void> {
-  const subcommand = args.positional[0]
-
-  if (!subcommand) {
-    console.error('Error: contacts subcommand required')
-    console.error('Available: status, suggest, review, link, reject, unify, search, show, analyze, split, rebuild-gmail, auto-accept, enrich-twitter, enrich-slack')
-    process.exit(1)
-  }
-
-  const db = getDb()
-
-  try {
-    switch (subcommand) {
-      case 'status':
-        await contactsStatus(db, args)
-        break
-      case 'suggest':
-        await contactsSuggest(db, args)
-        break
-      case 'review':
-        await contactsReview(db, args)
-        break
-      case 'link':
-        await contactsLink(db, args)
-        break
-      case 'reject':
-        await contactsReject(db, args)
-        break
-      case 'unify':
-        await contactsUnify(db, args)
-        break
-      case 'search':
-        await contactsSearch(db, args)
-        break
-      case 'show':
-        await contactsShow(db, args)
-        break
-      case 'analyze':
-        await contactsAnalyze(db, args)
-        break
-      case 'split':
-        await contactsSplit(db, args)
-        break
-      case 'rebuild-gmail':
-        await contactsRebuildGmail(db, args)
-        break
-      case 'auto-accept':
-        await contactsAutoAccept(db, args)
-        break
-      case 'enrich-twitter':
-        await contactsEnrichTwitter(db, args)
-        break
-      case 'enrich-slack':
-        await contactsEnrichSlack(db, args)
-        break
-      default:
-        console.error(`Unknown contacts subcommand: ${subcommand}`)
-        console.error('Available: status, suggest, review, link, reject, unify, search, show, analyze, split, rebuild-gmail, auto-accept, enrich-twitter, enrich-slack, enrich-slack')
-        process.exit(1)
-    }
-  } finally {
-    db.close()
-  }
-}
-
-async function contactsStatus(db: Database, args: ParsedArgs): Promise<void> {
-  const peopleCount = db.query(`SELECT COUNT(*) as count FROM people`).get() as { count: number }
-  const unifiedCount = db.query(`SELECT COUNT(*) as count FROM unified_contacts`).get() as { count: number }
-  const linkedCount = db.query(`SELECT COUNT(*) as count FROM contact_links`).get() as { count: number }
-  const pendingSuggestions = db.query(`SELECT COUNT(*) as count FROM contact_suggestions WHERE status = 'pending'`).get() as { count: number }
-  const rejectedCount = db.query(`SELECT COUNT(*) as count FROM contact_rejections`).get() as { count: number }
-
-  // Get suggestions by confidence band
-  const suggestionBands = db.query(`
-    SELECT
-      CASE
-        WHEN confidence >= 0.99 THEN '99%+'
-        WHEN confidence >= 0.90 THEN '90-99%'
-        WHEN confidence >= 0.70 THEN '70-90%'
-        WHEN confidence >= 0.50 THEN '50-70%'
-        ELSE '<50%'
-      END as band,
-      COUNT(*) as count
-    FROM contact_suggestions
-    WHERE status = 'pending'
-    GROUP BY 1
-    ORDER BY 1 DESC
-  `).all() as Array<{ band: string; count: number }>
-
-  // Get top duplicate groups by email
-  const duplicateGroups = db.query(`
-    SELECT
-      json_each.value as email,
-      COUNT(*) as count,
-      GROUP_CONCAT(p.display_name, ' | ') as names
-    FROM people p,
-         json_each(p.identifiers)
-    WHERE json_each.value LIKE '%@%'
-      AND json_each.value NOT LIKE '@%'
-      AND p.id NOT IN (SELECT person_id FROM contact_links)
-    GROUP BY json_each.value
-    HAVING COUNT(*) > 1
-    ORDER BY COUNT(*) DESC
-    LIMIT 10
-  `).all() as Array<{ email: string; count: number; names: string }>
-
-  const jsonOutput = args.flags.json
-
-  if (jsonOutput) {
-    console.log(JSON.stringify({
-      people: peopleCount.count,
-      unified: unifiedCount.count,
-      linked: linkedCount.count,
-      unlinked: peopleCount.count - linkedCount.count,
-      pending_suggestions: pendingSuggestions.count,
-      rejected: rejectedCount.count,
-      suggestion_bands: suggestionBands,
-      top_duplicates: duplicateGroups
-    }, null, 2))
-    return
-  }
-
-  console.log('═══════════════════════════════════════════════════════════════')
-  console.log('                   CONTACT UNIFICATION STATUS')
-  console.log('═══════════════════════════════════════════════════════════════\n')
-
-  console.log('OVERVIEW')
-  console.log('───────────────────────────────────────────────────────────────')
-  console.log(`People records:        ${formatNumber(peopleCount.count).padStart(8)}`)
-  console.log(`Unified contacts:      ${formatNumber(unifiedCount.count).padStart(8)}`)
-  console.log(`Linked records:        ${formatNumber(linkedCount.count).padStart(8)}`)
-  console.log(`Unlinked records:      ${formatNumber(peopleCount.count - linkedCount.count).padStart(8)}`)
-  console.log(`Pending suggestions:   ${formatNumber(pendingSuggestions.count).padStart(8)}`)
-  console.log(`Rejected pairs:        ${formatNumber(rejectedCount.count).padStart(8)}`)
-
-  if (suggestionBands.length > 0) {
-    console.log('\n\nPENDING SUGGESTIONS BY CONFIDENCE')
-    console.log('───────────────────────────────────────────────────────────────')
-    for (const band of suggestionBands) {
-      console.log(`${band.band.padEnd(10)} ${formatNumber(band.count).padStart(8)}`)
-    }
-  }
-
-  if (duplicateGroups.length > 0) {
-    console.log('\n\nTOP DUPLICATE EMAIL GROUPS')
-    console.log('───────────────────────────────────────────────────────────────')
-    for (const group of duplicateGroups) {
-      console.log(`${group.email}`)
-      console.log(`  ${group.count} records: ${group.names.slice(0, 80)}${group.names.length > 80 ? '...' : ''}`)
-    }
-  }
-
-  console.log('\n═══════════════════════════════════════════════════════════════')
-}
-
-async function contactsSuggest(db: Database, args: ParsedArgs): Promise<void> {
-  const useLLM = args.flags['use-llm']
-  const minConfidence = args.flags['min-confidence']
-    ? parseFloat(args.flags['min-confidence'] as string)
-    : 0.50
-  const limit = args.flags.limit as number | undefined
-  const dryRun = args.flags['dry-run']
-  const highInteraction = args.flags['high-interaction']
-
-  console.log('Finding match candidates...')
-  if (useLLM) console.log('  LLM evaluation: enabled')
-  console.log(`  Minimum confidence: ${Math.round(minConfidence * 100)}%`)
-  if (limit) console.log(`  Limit: ${limit}`)
-  if (highInteraction) console.log(`  High interaction only (5+ threads)`)
-  if (dryRun) console.log('  [DRY RUN]')
-
-  const candidates = findMatchCandidates(db, {
-    minConfidence,
-    limit: limit || 5000,
-    excludeAutoSenders: true,
-    highInteractionOnly: !!highInteraction
-  })
-
-  console.log(`Found ${formatNumber(candidates.length)} match candidates`)
-
-  if (candidates.length === 0) {
-    console.log('No new match candidates found.')
-    return
-  }
-
-  // Show confidence distribution
-  const bands = {
-    '99%+': 0,
-    '90-99%': 0,
-    '70-90%': 0,
-    '50-70%': 0,
-    '<50%': 0
-  }
-
-  for (const c of candidates) {
-    if (c.confidence >= 0.99) bands['99%+']++
-    else if (c.confidence >= 0.90) bands['90-99%']++
-    else if (c.confidence >= 0.70) bands['70-90%']++
-    else if (c.confidence >= 0.50) bands['50-70%']++
-    else bands['<50%']++
-  }
-
-  console.log('\nConfidence distribution:')
-  for (const [band, count] of Object.entries(bands)) {
-    if (count > 0) {
-      console.log(`  ${band.padEnd(8)} ${formatNumber(count).padStart(6)}`)
-    }
-  }
-
-  // LLM evaluation for medium-confidence candidates
-  let llmResults: Map<string, LLMMatchResult> | null = null
-  if (useLLM) {
-    const llmCandidates = candidates.filter(c => c.confidence >= 0.40 && c.confidence < 0.95)
-    if (llmCandidates.length > 0) {
-      console.log(`\nEvaluating ${llmCandidates.length} candidates with LLM...`)
-
-      llmResults = await batchEvaluateWithLLM(db, llmCandidates.slice(0, limit || 100), {
-        debug: !!args.flags.debug,
-        onProgress: (completed, total) => {
-          process.stdout.write(`\r  Progress: ${completed}/${total}`)
-        }
-      })
-      console.log('\n')
-    }
-  }
-
-  // Store suggestions
-  if (!dryRun) {
-    let stored = 0
-    for (const candidate of candidates) {
-      const [id1, id2] = [candidate.person1.id, candidate.person2.id].sort()
-
-      let confidence = candidate.confidence
-      let llmReasoning: string | null = null
-
-      // Update with LLM results if available
-      const llmKey = `${candidate.person1.id}|${candidate.person2.id}`
-      const llmResult = llmResults?.get(llmKey)
-      if (llmResult) {
-        if (llmResult.samePerson === true) {
-          confidence = Math.max(confidence, llmResult.confidence)
-        } else if (llmResult.samePerson === false) {
-          confidence = Math.min(confidence, 1 - llmResult.confidence)
-        }
-        llmReasoning = llmResult.reasoning
-      }
-
-      try {
-        db.query(`
-          INSERT OR REPLACE INTO contact_suggestions
-            (person_id_1, person_id_2, confidence, match_signals, llm_reasoning, status, created_at)
-          VALUES (?, ?, ?, ?, ?, 'pending', datetime('now'))
-        `).run(
-          id1,
-          id2,
-          confidence,
-          JSON.stringify(candidate.signals),
-          llmReasoning
-        )
-        stored++
-      } catch (e) {
-        // Already exists, skip
-      }
-    }
-    console.log(`Stored ${formatNumber(stored)} suggestions`)
-  }
-
-  // Show top candidates
-  console.log('\nTop candidates:')
-  console.log('───────────────────────────────────────────────────────────────')
-  for (const c of candidates.slice(0, 10)) {
-    const conf = Math.round(c.confidence * 100)
-    console.log(`[${conf}%] ${c.person1.display_name} ↔ ${c.person2.display_name}`)
-    for (const signal of c.signals.slice(0, 2)) {
-      console.log(`       ${signal.description}`)
-    }
-  }
-}
-
-async function contactsReview(db: Database, args: ParsedArgs): Promise<void> {
-  const limit = (args.flags.limit as number) || 20
-  const autoAccept = args.flags['auto-accept']
-    ? parseFloat(args.flags['auto-accept'] as string)
-    : null
-
-  // Auto-accept mode
-  if (autoAccept !== null) {
-    const highConfidence = db.query(`
-      SELECT * FROM contact_suggestions
-      WHERE status = 'pending' AND confidence >= ?
-      ORDER BY confidence DESC
-    `).all(autoAccept) as Array<{
-      id: number
-      person_id_1: string
-      person_id_2: string
-      confidence: number
-      match_signals: string
-    }>
-
-    console.log(`Found ${highConfidence.length} suggestions with confidence >= ${Math.round(autoAccept * 100)}%`)
-
-    if (highConfidence.length === 0) return
-
-    let accepted = 0
-    let skipped = 0
-
-    for (const suggestion of highConfidence) {
-      // Check if either person is an automated sender
-      const p1 = db.query(`SELECT * FROM people WHERE id = ?`).get(suggestion.person_id_1) as PersonRecord
-      const p2 = db.query(`SELECT * FROM people WHERE id = ?`).get(suggestion.person_id_2) as PersonRecord
-
-      if (isAutomatedSender(p1) || isAutomatedSender(p2)) {
-        console.log(`Skipping automated sender: ${p1.display_name} ↔ ${p2.display_name}`)
-        skipped++
-        continue
-      }
-
-      // Accept the suggestion
-      const unifiedId = await createOrExtendUnifiedContact(db, suggestion.person_id_1, suggestion.person_id_2, {
-        signals: JSON.parse(suggestion.match_signals || '[]'),
-        confidence: suggestion.confidence,
-        linkType: 'auto'
-      })
-
-      // Mark suggestion as accepted
-      db.query(`UPDATE contact_suggestions SET status = 'accepted', reviewed_at = datetime('now') WHERE id = ?`)
-        .run(suggestion.id)
-
-      accepted++
-      if (accepted % 50 === 0) {
-        console.log(`  Accepted ${accepted}...`)
-      }
-    }
-
-    console.log(`\nAuto-accepted: ${accepted}, Skipped (automated): ${skipped}`)
-    return
-  }
-
-  // Interactive review mode
-  const suggestions = db.query(`
-    SELECT cs.*, p1.display_name as name1, p2.display_name as name2,
-           p1.thread_count as threads1, p2.thread_count as threads2,
-           p1.identifiers as ids1, p2.identifiers as ids2,
-           p1.last_seen as last1, p2.last_seen as last2
-    FROM contact_suggestions cs
-    JOIN people p1 ON cs.person_id_1 = p1.id
-    JOIN people p2 ON cs.person_id_2 = p2.id
-    WHERE cs.status = 'pending'
-    ORDER BY cs.confidence DESC
-    LIMIT ?
-  `).all(limit) as Array<{
-    id: number
-    person_id_1: string
-    person_id_2: string
-    confidence: number
-    match_signals: string
-    llm_reasoning: string | null
-    name1: string
-    name2: string
-    threads1: number
-    threads2: number
-    ids1: string
-    ids2: string
-    last1: string
-    last2: string
-  }>
-
-  if (suggestions.length === 0) {
-    console.log('No pending suggestions to review.')
-    console.log('Run "deep-context contacts suggest" to generate new suggestions.')
-    return
-  }
-
-  console.log(`Reviewing ${suggestions.length} suggestions...\n`)
-
-  for (let i = 0; i < suggestions.length; i++) {
-    const s = suggestions[i]
-    const conf = Math.round(s.confidence * 100)
-
-    console.log('═══════════════════════════════════════════════════════════════')
-    console.log(`Match ${i + 1} of ${suggestions.length} │ Confidence: ${conf}% │ ${s.llm_reasoning ? 'LLM' : 'Heuristic'}`)
-    console.log('───────────────────────────────────────────────────────────────\n')
-
-    console.log(`Person A: ${s.name1} [${s.person_id_1}]`)
-    console.log(`  └─ Identifiers: ${s.ids1 || 'none'}`)
-    console.log(`  └─ Threads: ${s.threads1} │ Last: ${s.last1 ? s.last1.split('T')[0] : 'unknown'}`)
-    console.log()
-    console.log(`Person B: ${s.name2} [${s.person_id_2}]`)
-    console.log(`  └─ Identifiers: ${s.ids2 || 'none'}`)
-    console.log(`  └─ Threads: ${s.threads2} │ Last: ${s.last2 ? s.last2.split('T')[0] : 'unknown'}`)
-
-    if (s.llm_reasoning) {
-      console.log(`\nLLM reasoning: "${s.llm_reasoning}"`)
-    }
-
-    const signals = JSON.parse(s.match_signals || '[]') as MatchSignal[]
-    if (signals.length > 0) {
-      console.log('\nMatch signals:')
-      for (const sig of signals) {
-        console.log(`  - ${sig.description}`)
-      }
-    }
-
-    console.log('\n[y] Accept  [n] Reject  [s] Skip  [q] Quit')
-
-    // Read user input
-    process.stdout.write('> ')
-    const input = await readLineFromStdin()
-    const choice = input.trim().toLowerCase()
-
-    switch (choice) {
-      case 'y':
-      case 'yes':
-        const unifiedId = await createOrExtendUnifiedContact(db, s.person_id_1, s.person_id_2, {
-          signals,
-          confidence: s.confidence,
-          linkType: 'confirmed'
-        })
-        db.query(`UPDATE contact_suggestions SET status = 'accepted', reviewed_at = datetime('now') WHERE id = ?`)
-          .run(s.id)
-        console.log(`\n✓ Accepted. Unified contact: ${unifiedId}\n`)
-        break
-
-      case 'n':
-      case 'no':
-        // Add to rejections
-        const [rid1, rid2] = [s.person_id_1, s.person_id_2].sort()
-        db.query(`INSERT OR IGNORE INTO contact_rejections (person_id_1, person_id_2) VALUES (?, ?)`)
-          .run(rid1, rid2)
-        db.query(`UPDATE contact_suggestions SET status = 'rejected', reviewed_at = datetime('now') WHERE id = ?`)
-          .run(s.id)
-        console.log('\n✗ Rejected.\n')
-        break
-
-      case 's':
-      case 'skip':
-        console.log('\n→ Skipped.\n')
-        break
-
-      case 'q':
-      case 'quit':
-        console.log('\nExiting review.')
-        return
-
-      default:
-        console.log('\n? Unknown input, skipping.\n')
-    }
-  }
-
-  console.log('\nReview complete.')
-}
-
-async function readLineFromStdin(): Promise<string> {
-  const buf = new Uint8Array(1024)
-  const n = await Bun.stdin.stream().getReader().read()
-  return new TextDecoder().decode(n.value).trim()
-}
-
-async function createOrExtendUnifiedContact(
-  db: Database,
-  personId1: string,
-  personId2: string,
-  opts: { signals: MatchSignal[]; confidence: number; linkType: string }
-): Promise<string> {
-  // Check if either person is already linked to a unified contact
-  const existing1 = db.query(`SELECT unified_contact_id FROM contact_links WHERE person_id = ?`)
-    .get(personId1) as { unified_contact_id: string } | null
-  const existing2 = db.query(`SELECT unified_contact_id FROM contact_links WHERE person_id = ?`)
-    .get(personId2) as { unified_contact_id: string } | null
-
-  let unifiedId: string
-
-  if (existing1 && existing2) {
-    // Both already linked - merge into first
-    if (existing1.unified_contact_id !== existing2.unified_contact_id) {
-      // Update all links from second unified contact to first
-      db.query(`UPDATE contact_links SET unified_contact_id = ? WHERE unified_contact_id = ?`)
-        .run(existing1.unified_contact_id, existing2.unified_contact_id)
-      // Delete second unified contact
-      db.query(`DELETE FROM unified_contacts WHERE id = ?`).run(existing2.unified_contact_id)
-    }
-    unifiedId = existing1.unified_contact_id
-  } else if (existing1) {
-    // Person 1 already linked, add person 2
-    unifiedId = existing1.unified_contact_id
-    db.query(`
-      INSERT INTO contact_links (unified_contact_id, person_id, confidence, link_type, match_reason)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(unifiedId, personId2, opts.confidence, opts.linkType, JSON.stringify(opts.signals))
-  } else if (existing2) {
-    // Person 2 already linked, add person 1
-    unifiedId = existing2.unified_contact_id
-    db.query(`
-      INSERT INTO contact_links (unified_contact_id, person_id, confidence, link_type, match_reason)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(unifiedId, personId1, opts.confidence, opts.linkType, JSON.stringify(opts.signals))
-  } else {
-    // Neither linked, create new unified contact
-    const p1 = db.query(`SELECT * FROM people WHERE id = ?`).get(personId1) as PersonRecord
-    const p2 = db.query(`SELECT * FROM people WHERE id = ?`).get(personId2) as PersonRecord
-
-    // Choose the better name (longer, more complete)
-    const canonicalName = p1.display_name.length >= p2.display_name.length ? p1.display_name : p2.display_name
-
-    // Extract canonical identifiers
-    const ids1 = parseIdentifiers(p1.identifiers)
-    const ids2 = parseIdentifiers(p2.identifiers)
-    const canonicalEmail = ids1.emails[0] || ids2.emails[0] || null
-    const canonicalPhone = ids1.phones[0] || ids2.phones[0] || null
-    const canonicalTwitter = ids1.twitterIds[0] || ids2.twitterIds[0] || null
-
-    // Use best organization/title
-    const organization = p1.organization || p2.organization
-    const title = p1.title || p2.title
-
-    // Aggregate stats
-    const totalThreads = (p1.thread_count || 0) + (p2.thread_count || 0)
-    const totalMessages = (p1.message_count || 0) + (p2.message_count || 0)
-    const firstSeen = p1.first_seen && p2.first_seen
-      ? (p1.first_seen < p2.first_seen ? p1.first_seen : p2.first_seen)
-      : (p1.first_seen || p2.first_seen)
-    const lastSeen = p1.last_seen && p2.last_seen
-      ? (p1.last_seen > p2.last_seen ? p1.last_seen : p2.last_seen)
-      : (p1.last_seen || p2.last_seen)
-
-    // Generate ID from canonical name
-    unifiedId = `unified-${slugify(canonicalName)}-${Date.now().toString(36)}`
-
-    db.query(`
-      INSERT INTO unified_contacts
-        (id, canonical_name, canonical_email, canonical_phone, canonical_twitter,
-         organization, title, total_thread_count, total_message_count, first_seen, last_seen)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      unifiedId, canonicalName, canonicalEmail, canonicalPhone, canonicalTwitter,
-      organization, title, totalThreads, totalMessages, firstSeen, lastSeen
-    )
-
-    // Link both people
-    db.query(`
-      INSERT INTO contact_links (unified_contact_id, person_id, confidence, link_type, match_reason)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(unifiedId, personId1, opts.confidence, opts.linkType, JSON.stringify(opts.signals))
-
-    db.query(`
-      INSERT INTO contact_links (unified_contact_id, person_id, confidence, link_type, match_reason)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(unifiedId, personId2, opts.confidence, opts.linkType, JSON.stringify(opts.signals))
-  }
-
-  // Update aggregated stats on unified contact
-  updateUnifiedContactStats(db, unifiedId)
-
-  return unifiedId
-}
-
-function updateUnifiedContactStats(db: Database, unifiedId: string): void {
-  // Aggregate stats from all linked people
-  const stats = db.query(`
-    SELECT
-      SUM(p.thread_count) as total_threads,
-      SUM(p.message_count) as total_messages,
-      MIN(p.first_seen) as first_seen,
-      MAX(p.last_seen) as last_seen
-    FROM contact_links cl
-    JOIN people p ON cl.person_id = p.id
-    WHERE cl.unified_contact_id = ?
-  `).get(unifiedId) as {
-    total_threads: number
-    total_messages: number
-    first_seen: string
-    last_seen: string
-  }
-
-  db.query(`
-    UPDATE unified_contacts
-    SET total_thread_count = ?,
-        total_message_count = ?,
-        first_seen = ?,
-        last_seen = ?,
-        updated_at = datetime('now')
-    WHERE id = ?
-  `).run(stats.total_threads, stats.total_messages, stats.first_seen, stats.last_seen, unifiedId)
-}
-
-async function contactsLink(db: Database, args: ParsedArgs): Promise<void> {
-  const person1 = args.positional[1]
-  const person2 = args.positional[2]
-
-  if (!person1 || !person2) {
-    console.error('Usage: deep-context contacts link <person1> <person2>')
-    process.exit(1)
-  }
-
-  // Verify both people exist
-  const p1 = db.query(`SELECT * FROM people WHERE id = ?`).get(person1) as PersonRecord | null
-  const p2 = db.query(`SELECT * FROM people WHERE id = ?`).get(person2) as PersonRecord | null
-
-  if (!p1) {
-    console.error(`Person not found: ${person1}`)
-    process.exit(1)
-  }
-  if (!p2) {
-    console.error(`Person not found: ${person2}`)
-    process.exit(1)
-  }
-
-  // Check if already rejected
-  const [id1, id2] = [person1, person2].sort()
-  const rejected = db.query(`
-    SELECT * FROM contact_rejections
-    WHERE (person_id_1 = ? AND person_id_2 = ?)
-       OR (person_id_1 = ? AND person_id_2 = ?)
-  `).get(id1, id2, id2, id1)
-
-  if (rejected) {
-    console.warn('Warning: This pair was previously rejected.')
-    console.log('Proceeding with link anyway...')
-    db.query(`DELETE FROM contact_rejections WHERE person_id_1 = ? AND person_id_2 = ?`).run(id1, id2)
-  }
-
-  const signals = comparePersons(p1, p2)
-  const confidence = calculateConfidence(signals)
-
-  const unifiedId = await createOrExtendUnifiedContact(db, person1, person2, {
-    signals,
-    confidence: confidence || 1.0,
-    linkType: 'confirmed'
-  })
-
-  console.log(`Linked: ${p1.display_name} ↔ ${p2.display_name}`)
-  console.log(`Unified contact: ${unifiedId}`)
-}
-
-async function contactsReject(db: Database, args: ParsedArgs): Promise<void> {
-  const person1 = args.positional[1]
-  const person2 = args.positional[2]
-
-  if (!person1 || !person2) {
-    console.error('Usage: deep-context contacts reject <person1> <person2>')
-    process.exit(1)
-  }
-
-  const [id1, id2] = [person1, person2].sort()
-
-  db.query(`INSERT OR IGNORE INTO contact_rejections (person_id_1, person_id_2) VALUES (?, ?)`)
-    .run(id1, id2)
-
-  // Also update any pending suggestion
-  db.query(`
-    UPDATE contact_suggestions
-    SET status = 'rejected', reviewed_at = datetime('now')
-    WHERE (person_id_1 = ? AND person_id_2 = ?) OR (person_id_1 = ? AND person_id_2 = ?)
-  `).run(id1, id2, id2, id1)
-
-  console.log(`Rejected: ${person1} ≠ ${person2}`)
-}
-
-async function contactsUnify(db: Database, args: ParsedArgs): Promise<void> {
-  const personIds = args.positional.slice(1)
-  const canonicalName = args.flags.name as string | undefined
-
-  if (personIds.length < 1) {
-    console.error('Usage: deep-context contacts unify <person1> [person2...] --name "Canonical Name"')
-    process.exit(1)
-  }
-
-  // Verify all people exist
-  const people: PersonRecord[] = []
-  for (const id of personIds) {
-    const person = db.query(`SELECT * FROM people WHERE id = ?`).get(id) as PersonRecord | null
-    if (!person) {
-      console.error(`Person not found: ${id}`)
-      process.exit(1)
-    }
-    people.push(person)
-  }
-
-  // Create unified contact
-  const name = canonicalName || people.reduce((a, b) =>
-    a.display_name.length >= b.display_name.length ? a : b
-  ).display_name
-
-  const ids = people.flatMap(p => parseIdentifiers(p.identifiers))
-  const canonicalEmail = ids.flatMap(i => i.emails)[0] || null
-  const canonicalPhone = ids.flatMap(i => i.phones)[0] || null
-  const canonicalTwitter = ids.flatMap(i => i.twitterIds)[0] || null
-
-  const unifiedId = `unified-${slugify(name)}-${Date.now().toString(36)}`
-
-  db.query(`
-    INSERT INTO unified_contacts
-      (id, canonical_name, canonical_email, canonical_phone, canonical_twitter)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(unifiedId, name, canonicalEmail, canonicalPhone, canonicalTwitter)
-
-  // Link all people
-  for (const person of people) {
-    // Remove from any existing unified contact
-    db.query(`DELETE FROM contact_links WHERE person_id = ?`).run(person.id)
-
-    db.query(`
-      INSERT INTO contact_links (unified_contact_id, person_id, confidence, link_type)
-      VALUES (?, ?, 1.0, 'confirmed')
-    `).run(unifiedId, person.id)
-  }
-
-  updateUnifiedContactStats(db, unifiedId)
-
-  console.log(`Created unified contact: ${unifiedId}`)
-  console.log(`Canonical name: ${name}`)
-  console.log(`Linked ${people.length} people records`)
-}
-
-async function contactsSearch(db: Database, args: ParsedArgs): Promise<void> {
-  const query = args.positional[1]
-
-  if (!query) {
-    console.error('Usage: deep-context contacts search <query>')
-    process.exit(1)
-  }
-
-  const searchPattern = `%${query}%`
-
-  // Search unified contacts
-  const unified = db.query(`
-    SELECT uc.*, GROUP_CONCAT(cl.person_id) as linked_ids
-    FROM unified_contacts uc
-    LEFT JOIN contact_links cl ON uc.id = cl.unified_contact_id
-    WHERE uc.canonical_name LIKE ?
-       OR uc.canonical_email LIKE ?
-       OR uc.organization LIKE ?
-    GROUP BY uc.id
-    ORDER BY uc.total_thread_count DESC
-    LIMIT 20
-  `).all(searchPattern, searchPattern, searchPattern) as Array<{
-    id: string
-    canonical_name: string
-    canonical_email: string | null
-    organization: string | null
-    total_thread_count: number
-    linked_ids: string | null
-  }>
-
-  // Also search unlinked people
-  const unlinked = db.query(`
-    SELECT p.*
-    FROM people p
-    WHERE p.id NOT IN (SELECT person_id FROM contact_links)
-      AND (p.display_name LIKE ? OR p.identifiers LIKE ? OR p.organization LIKE ?)
-    ORDER BY p.thread_count DESC
-    LIMIT 20
-  `).all(searchPattern, searchPattern, searchPattern) as PersonRecord[]
-
-  const jsonOutput = args.flags.json
-
-  if (jsonOutput) {
-    console.log(JSON.stringify({ unified, unlinked }, null, 2))
-    return
-  }
-
-  console.log(`Search results for "${query}":\n`)
-
-  if (unified.length > 0) {
-    console.log('UNIFIED CONTACTS')
-    console.log('───────────────────────────────────────────────────────────────')
-    for (const u of unified) {
-      const sourceCount = u.linked_ids ? u.linked_ids.split(',').length : 0
-      console.log(`${u.canonical_name}`)
-      console.log(`  ID: ${u.id}`)
-      if (u.canonical_email) console.log(`  Email: ${u.canonical_email}`)
-      if (u.organization) console.log(`  Org: ${u.organization}`)
-      console.log(`  Threads: ${u.total_thread_count} │ Sources: ${sourceCount}`)
-      console.log()
-    }
-  }
-
-  if (unlinked.length > 0) {
-    console.log('\nUNLINKED PEOPLE')
-    console.log('───────────────────────────────────────────────────────────────')
-    for (const p of unlinked) {
-      console.log(`${p.display_name} [${p.id}]`)
-      if (p.identifiers) console.log(`  Identifiers: ${p.identifiers}`)
-      console.log(`  Threads: ${p.thread_count}`)
-    }
-  }
-
-  if (unified.length === 0 && unlinked.length === 0) {
-    console.log('No results found.')
-  }
-}
-
-async function contactsShow(db: Database, args: ParsedArgs): Promise<void> {
-  const id = args.positional[1]
-
-  if (!id) {
-    console.error('Usage: deep-context contacts show <id>')
-    process.exit(1)
-  }
-
-  // Try unified contact first
-  const unified = db.query(`SELECT * FROM unified_contacts WHERE id = ?`).get(id) as {
-    id: string
-    canonical_name: string
-    canonical_email: string | null
-    canonical_phone: string | null
-    canonical_twitter: string | null
-    organization: string | null
-    title: string | null
-    relationship_type: string | null
-    relationship_summary: string | null
-    notes: string | null
-    total_thread_count: number
-    total_message_count: number
-    first_seen: string | null
-    last_seen: string | null
-  } | null
-
-  if (unified) {
-    console.log('═══════════════════════════════════════════════════════════════')
-    console.log(`UNIFIED CONTACT: ${unified.canonical_name}`)
-    console.log('═══════════════════════════════════════════════════════════════\n')
-
-    console.log(`ID: ${unified.id}`)
-    if (unified.canonical_email) console.log(`Email: ${unified.canonical_email}`)
-    if (unified.canonical_phone) console.log(`Phone: ${unified.canonical_phone}`)
-    if (unified.canonical_twitter) console.log(`Twitter: ${unified.canonical_twitter}`)
-    if (unified.organization) console.log(`Organization: ${unified.organization}`)
-    if (unified.title) console.log(`Title: ${unified.title}`)
-    if (unified.relationship_type) console.log(`Relationship: ${unified.relationship_type}`)
-
-    console.log(`\nActivity:`)
-    console.log(`  Threads: ${unified.total_thread_count}`)
-    console.log(`  Messages: ${unified.total_message_count}`)
-    console.log(`  First seen: ${unified.first_seen || 'unknown'}`)
-    console.log(`  Last seen: ${unified.last_seen || 'unknown'}`)
-
-    // Show linked people
-    const linked = db.query(`
-      SELECT cl.*, p.display_name, p.identifiers, p.thread_count
-      FROM contact_links cl
-      JOIN people p ON cl.person_id = p.id
-      WHERE cl.unified_contact_id = ?
-      ORDER BY p.thread_count DESC
-    `).all(id) as Array<{
-      person_id: string
-      display_name: string
-      identifiers: string | null
-      thread_count: number
-      confidence: number
-      link_type: string
-    }>
-
-    if (linked.length > 0) {
-      console.log('\nLinked records:')
-      console.log('───────────────────────────────────────────────────────────────')
-      for (const l of linked) {
-        console.log(`  ${l.display_name} [${l.person_id}]`)
-        console.log(`    Identifiers: ${l.identifiers || 'none'}`)
-        console.log(`    Threads: ${l.thread_count} │ Link: ${l.link_type} (${Math.round(l.confidence * 100)}%)`)
-      }
-    }
-
-    if (unified.relationship_summary) {
-      console.log('\nRelationship Summary:')
-      console.log('───────────────────────────────────────────────────────────────')
-      console.log(unified.relationship_summary)
-    }
-
-    if (unified.notes) {
-      console.log('\nNotes:')
-      console.log('───────────────────────────────────────────────────────────────')
-      console.log(unified.notes)
-    }
-
-    return
-  }
-
-  // Try person record
-  const person = db.query(`SELECT * FROM people WHERE id = ?`).get(id) as PersonRecord | null
-
-  if (person) {
-    console.log('═══════════════════════════════════════════════════════════════')
-    console.log(`PERSON: ${person.display_name}`)
-    console.log('═══════════════════════════════════════════════════════════════\n')
-
-    console.log(`ID: ${person.id}`)
-    console.log(`Identifiers: ${person.identifiers || 'none'}`)
-    if (person.organization) console.log(`Organization: ${person.organization}`)
-    if (person.title) console.log(`Title: ${person.title}`)
-    if (person.relationship_type) console.log(`Relationship: ${person.relationship_type}`)
-
-    console.log(`\nActivity:`)
-    console.log(`  Threads: ${person.thread_count}`)
-    console.log(`  Messages: ${person.message_count}`)
-    console.log(`  First seen: ${person.first_seen || 'unknown'}`)
-    console.log(`  Last seen: ${person.last_seen || 'unknown'}`)
-
-    // Check if linked
-    const link = db.query(`SELECT * FROM contact_links WHERE person_id = ?`).get(id) as { unified_contact_id: string } | null
-    if (link) {
-      console.log(`\nLinked to unified contact: ${link.unified_contact_id}`)
-    } else {
-      console.log(`\nNot yet unified (standalone record)`)
-    }
-
-    return
-  }
-
-  console.error(`Not found: ${id}`)
-  process.exit(1)
-}
-
-/**
- * Analyze contaminated person records.
- *
- * Contamination happens when multiple different people share the same person ID
- * because they have single-word display names (e.g., "John" from john@acme.com and
- * john@gmail.com both created "john" as the person ID).
- *
- * This command finds records that likely have this problem by looking for:
- * - Single-word display names
- * - Multiple email domains in the identifiers
- */
-async function contactsAnalyze(db: Database, args: ParsedArgs): Promise<void> {
-  const minDomains = args.flags['min-domains'] ? parseInt(args.flags['min-domains'] as string, 10) : 3
-  const limit = args.flags.limit as number | undefined || 50
-  const jsonOutput = args.flags.json
-
-  // Find contaminated records: single-word name with emails from multiple domains
-  const contaminated = db.query(`
-    WITH email_domains AS (
-      SELECT
-        p.id,
-        p.display_name,
-        p.identifiers,
-        p.thread_count,
-        json_each.value as email
-      FROM people p,
-           json_each(p.identifiers)
-      WHERE json_each.value LIKE '%@%'
-        AND p.display_name NOT LIKE '% %'
-    ),
-    domain_counts AS (
-      SELECT
-        id,
-        display_name,
-        identifiers,
-        thread_count,
-        COUNT(DISTINCT LOWER(SUBSTR(email, INSTR(email, '@') + 1))) as domain_count,
-        GROUP_CONCAT(DISTINCT LOWER(SUBSTR(email, INSTR(email, '@') + 1))) as domains
-      FROM email_domains
-      GROUP BY id
-    )
-    SELECT *
-    FROM domain_counts
-    WHERE domain_count >= ?
-    ORDER BY domain_count DESC, thread_count DESC
-    LIMIT ?
-  `).all(minDomains, limit) as Array<{
-    id: string
-    display_name: string
-    identifiers: string
-    thread_count: number
-    domain_count: number
-    domains: string
-  }>
-
-  if (jsonOutput) {
-    console.log(JSON.stringify(contaminated, null, 2))
-    return
-  }
-
-  if (contaminated.length === 0) {
-    console.log(`No contaminated records found with ${minDomains}+ domains.`)
-    console.log('Try lowering --min-domains to find more candidates.')
-    return
-  }
-
-  console.log('═══════════════════════════════════════════════════════════════')
-  console.log('              CONTAMINATED CONTACT RECORDS')
-  console.log('═══════════════════════════════════════════════════════════════\n')
-  console.log(`Found ${contaminated.length} records with ${minDomains}+ email domains.\n`)
-  console.log('These records likely contain multiple different people merged together')
-  console.log('because they have single-word names like "John" from different orgs.\n')
-
-  console.log('ID'.padEnd(30) + 'NAME'.padEnd(15) + 'DOMAINS'.padEnd(8) + 'THREADS'.padEnd(10) + 'EMAIL DOMAINS')
-  console.log('─'.repeat(100))
-
-  for (const record of contaminated) {
-    const domainList = record.domains.split(',').slice(0, 5).join(', ')
-    const more = record.domain_count > 5 ? ` (+${record.domain_count - 5} more)` : ''
-
-    console.log(
-      record.id.slice(0, 29).padEnd(30) +
-      record.display_name.slice(0, 14).padEnd(15) +
-      String(record.domain_count).padEnd(8) +
-      String(record.thread_count).padEnd(10) +
-      domainList + more
-    )
-  }
-
-  console.log('\n═══════════════════════════════════════════════════════════════')
-  console.log('\nTo fix a contaminated record, run:')
-  console.log('  deep-context contacts split <id>')
-  console.log('\nThis will:')
-  console.log('  1. Create separate person records for each email domain')
-  console.log('  2. Update all thread participant_ids to point to new records')
-  console.log('  3. Update all message sender_ids to point to new records')
-  console.log('  4. Delete the contaminated record')
-}
-
-/**
- * Split a contaminated person record into separate records by email domain.
- *
- * This fixes records that were incorrectly merged because multiple people
- * shared the same single-word name (e.g., "john" from john@acme.com and
- * john@gmail.com).
- */
-async function contactsSplit(db: Database, args: ParsedArgs): Promise<void> {
-  const personId = args.positional[1]
-  const dryRun = args.flags['dry-run']
-
-  if (!personId) {
-    console.error('Usage: deep-context contacts split <person-id> [--dry-run]')
-    console.error('')
-    console.error('Splits a contaminated person record into separate records by email domain.')
-    console.error('Run "deep-context contacts analyze" first to find contaminated records.')
-    process.exit(1)
-  }
-
-  // Get the person record
-  const person = db.query(`SELECT * FROM people WHERE id = ?`).get(personId) as {
-    id: string
-    display_name: string
-    identifiers: string | null
-    first_seen: string | null
-    last_seen: string | null
-    thread_count: number
-  } | null
-
-  if (!person) {
-    console.error(`Person not found: ${personId}`)
-    process.exit(1)
-  }
-
-  const emails = JSON.parse(person.identifiers || '[]') as string[]
-  if (emails.length < 2) {
-    console.log(`Person "${personId}" has only ${emails.length} email(s). Nothing to split.`)
-    return
-  }
-
-  // Group emails by domain
-  const emailsByDomain = new Map<string, string[]>()
-  for (const email of emails) {
-    const domain = email.split('@')[1]?.toLowerCase() || 'unknown'
-    const domainKey = domain.split('.')[0]  // "acme" from "acme.com"
-    if (!emailsByDomain.has(domainKey)) {
-      emailsByDomain.set(domainKey, [])
-    }
-    emailsByDomain.get(domainKey)!.push(email)
-  }
-
-  if (emailsByDomain.size < 2) {
-    console.log(`Person "${personId}" has emails from only 1 domain. Nothing to split.`)
-    return
-  }
-
-  console.log('═══════════════════════════════════════════════════════════════')
-  console.log(`SPLITTING: ${person.display_name} [${person.id}]`)
-  console.log('═══════════════════════════════════════════════════════════════\n')
-
-  if (dryRun) console.log('[DRY RUN]\n')
-
-  console.log(`Current emails (${emails.length}):`)
-  for (const email of emails) {
-    console.log(`  ${email}`)
-  }
-
-  console.log(`\nWill create ${emailsByDomain.size} new person records:\n`)
-
-  // Create new person records for each domain
-  const newPersonIds: Array<{ id: string; domain: string; emails: string[] }> = []
-
-  for (const [domainKey, domainEmails] of emailsByDomain) {
-    const newId = `${person.display_name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${domainKey}`
-    newPersonIds.push({ id: newId, domain: domainKey, emails: domainEmails })
-
-    console.log(`  ${newId}`)
-    for (const email of domainEmails) {
-      console.log(`    └─ ${email}`)
-    }
-  }
-
-  // Find all threads that reference this person
-  const threads = db.query(`
-    SELECT id, participant_ids
-    FROM threads
-    WHERE participant_ids LIKE ?
-  `).all(`%"${personId}"%`) as Array<{ id: string; participant_ids: string }>
-
-  console.log(`\nAffected threads: ${threads.length}`)
-
-  // Find all messages from this person
-  const messages = db.query(`
-    SELECT id, sender_id, thread_id
-    FROM messages
-    WHERE sender_id = ?
-  `).all(personId) as Array<{ id: string; sender_id: string; thread_id: string }>
-
-  console.log(`Affected messages: ${messages.length}`)
-
-  if (dryRun) {
-    console.log('\n[DRY RUN] No changes made. Remove --dry-run to execute.')
-    return
-  }
-
-  // Build email-to-newId lookup
-  const emailToNewId = new Map<string, string>()
-  for (const { id, emails: domainEmails } of newPersonIds) {
-    for (const email of domainEmails) {
-      emailToNewId.set(email.toLowerCase(), id)
-    }
-  }
-
-  // Create new person records
-  for (const { id, emails: domainEmails } of newPersonIds) {
-    // Check if new ID already exists (shouldn't, but be safe)
-    const existing = db.query(`SELECT id FROM people WHERE id = ?`).get(id)
-    if (existing) {
-      console.log(`  Warning: ${id} already exists, merging emails`)
-      const existingRecord = db.query(`SELECT identifiers FROM people WHERE id = ?`).get(id) as { identifiers: string }
-      const existingEmails = JSON.parse(existingRecord.identifiers || '[]') as string[]
-      const mergedEmails = [...new Set([...existingEmails, ...domainEmails])]
-      db.query(`UPDATE people SET identifiers = ? WHERE id = ?`).run(JSON.stringify(mergedEmails), id)
-    } else {
-      db.query(`
-        INSERT INTO people (id, display_name, identifiers, first_seen, last_seen, thread_count)
-        VALUES (?, ?, ?, ?, ?, 0)
-      `).run(
-        id,
-        person.display_name,
-        JSON.stringify(domainEmails),
-        person.first_seen,
-        person.last_seen
-      )
-    }
-  }
-
-  // Update threads: need to figure out which new person ID to use
-  // Strategy: look at the messages in the thread to determine which email was used
-  let threadsUpdated = 0
-  for (const thread of threads) {
-    const participantIds = JSON.parse(thread.participant_ids) as string[]
-    const idx = participantIds.indexOf(personId)
-    if (idx === -1) continue
-
-    // Find messages in this thread from the old person ID to determine the right new ID
-    const threadMessages = db.query(`
-      SELECT m.id, m.raw_json
-      FROM messages m
-      WHERE m.thread_id = ? AND m.sender_id = ?
-    `).all(thread.id, personId) as Array<{ id: string; raw_json: string }>
-
-    let newId = newPersonIds[0].id  // Default to first one
-
-    // Try to extract email from message headers to find right new ID
-    for (const msg of threadMessages) {
-      try {
-        const rawJson = JSON.parse(msg.raw_json || '{}')
-        const fromHeader = rawJson.headers?.find((h: { name: string; value: string }) =>
-          h.name.toLowerCase() === 'from'
-        )?.value
-        if (fromHeader) {
-          const emailMatch = fromHeader.match(/<([^>]+)>/) || [null, fromHeader]
-          const email = emailMatch[1]?.toLowerCase()
-          if (email && emailToNewId.has(email)) {
-            newId = emailToNewId.get(email)!
-            break
-          }
-        }
-      } catch {}
-    }
-
-    // Update participant_ids with the new ID
-    participantIds[idx] = newId
-    db.query(`UPDATE threads SET participant_ids = ? WHERE id = ?`)
-      .run(JSON.stringify(participantIds), thread.id)
-    threadsUpdated++
-  }
-
-  // Update messages: use raw_json to find the right email
-  let messagesUpdated = 0
-  for (const msg of messages) {
-    let newId = newPersonIds[0].id  // Default
-
-    try {
-      const rawJson = JSON.parse(
-        (db.query(`SELECT raw_json FROM messages WHERE id = ?`).get(msg.id) as { raw_json: string })?.raw_json || '{}'
-      )
-      const fromHeader = rawJson.headers?.find((h: { name: string; value: string }) =>
-        h.name.toLowerCase() === 'from'
-      )?.value
-      if (fromHeader) {
-        const emailMatch = fromHeader.match(/<([^>]+)>/) || [null, fromHeader]
-        const email = emailMatch[1]?.toLowerCase()
-        if (email && emailToNewId.has(email)) {
-          newId = emailToNewId.get(email)!
-        }
-      }
-    } catch {}
-
-    db.query(`UPDATE messages SET sender_id = ? WHERE id = ?`).run(newId, msg.id)
-    messagesUpdated++
-  }
-
-  // Update thread counts for new person records
-  for (const { id } of newPersonIds) {
-    const count = db.query(`
-      SELECT COUNT(DISTINCT t.id) as count
-      FROM threads t
-      WHERE t.participant_ids LIKE ?
-    `).get(`%"${id}"%`) as { count: number }
-
-    db.query(`UPDATE people SET thread_count = ? WHERE id = ?`).run(count.count, id)
-  }
-
-  // Delete old person record
-  db.query(`DELETE FROM people WHERE id = ?`).run(personId)
-
-  // Clean up any contact_links pointing to the old person
-  db.query(`DELETE FROM contact_links WHERE person_id = ?`).run(personId)
-
-  // Clean up any contact_suggestions involving the old person
-  db.query(`DELETE FROM contact_suggestions WHERE person_id_1 = ? OR person_id_2 = ?`).run(personId, personId)
-
-  console.log(`\n✓ Created ${newPersonIds.length} new person records`)
-  console.log(`✓ Updated ${threadsUpdated} threads`)
-  console.log(`✓ Updated ${messagesUpdated} messages`)
-  console.log(`✓ Deleted contaminated record: ${personId}`)
-}
-
-/**
- * Rebuild Gmail person IDs from raw_json headers.
- *
- * This fixes contamination where multiple people were merged because they
- * shared single-word names like "John" from different email domains.
- *
- * Algorithm:
- * 1. Query all Gmail messages with raw_json
- * 2. For each message, parse From header from raw_json
- * 3. Compute new person ID using createPersonId(displayName, email)
- * 4. Create new person records
- * 5. Update messages.sender_id for Gmail messages
- * 6. Update threads.participant_ids for Gmail threads
- * 7. Delete orphaned people records
- */
-async function contactsRebuildGmail(db: Database, args: ParsedArgs): Promise<void> {
-  const dryRun = args.flags['dry-run']
-
-  console.log('═══════════════════════════════════════════════════════════════')
-  console.log('            REBUILD GMAIL PERSON IDS FROM RAW DATA')
-  console.log('═══════════════════════════════════════════════════════════════\n')
-
-  if (dryRun) console.log('[DRY RUN]\n')
-
-  const ownerId = OWNER_CONFIG.personId
-
-  // Step 1: Get all Gmail messages with raw_json
-  console.log('Step 1: Querying Gmail messages with raw_json...')
-  const gmailMessages = db.query(`
-    SELECT id, thread_id, sender_id, raw_json
-    FROM messages
-    WHERE source = 'gmail'
-      AND is_from_me = 0
-      AND raw_json IS NOT NULL
-  `).all() as Array<{
-    id: string
-    thread_id: string
-    sender_id: string
-    raw_json: string
-  }>
-
-  console.log(`Found ${formatNumber(gmailMessages.length)} Gmail messages from others with raw_json`)
-
-  // Step 2: First pass - collect all emails and their display names
-  console.log('\nStep 2: First pass - collecting emails and display names...')
-
-  // Track: email -> Set of display names seen for this email
-  const emailToDisplayNames = new Map<string, Set<string>>()
-  // Track: message_id -> email (for second pass)
-  const messageToEmail = new Map<string, string>()
-  // Track: old_sender_id -> email (for contamination analysis)
-  const senderToEmails = new Map<string, Set<string>>()
-  // Track parse failures
-  let parseFailures = 0
-
-  for (const msg of gmailMessages) {
-    try {
-      const rawJson = JSON.parse(msg.raw_json || '{}')
-      const fromHeader = rawJson.headers?.find((h: { name: string; value: string }) =>
-        h.name.toLowerCase() === 'from'
-      )?.value
-
-      if (!fromHeader) {
-        parseFailures++
-        continue
-      }
-
-      // Extract email and display name from "Name <email@domain.com>" format
-      let email: string
-      let displayName: string
-
-      const emailMatch = fromHeader.match(/<([^>]+)>/)
-      if (emailMatch) {
-        email = emailMatch[1].toLowerCase()
-        // Extract display name (everything before the <)
-        const nameMatch = fromHeader.match(/^"?([^"<]+)"?\s*</)
-        displayName = nameMatch ? nameMatch[1].trim() : email.split('@')[0]
-      } else {
-        // No angle brackets, treat the whole thing as email
-        email = fromHeader.toLowerCase().trim()
-        displayName = email.split('@')[0]
-      }
-
-      if (!email.includes('@')) {
-        parseFailures++
-        continue
-      }
-
-      // Collect display names for this email
-      if (!emailToDisplayNames.has(email)) {
-        emailToDisplayNames.set(email, new Set())
-      }
-      emailToDisplayNames.get(email)!.add(displayName)
-
-      // Track message -> email for second pass
-      messageToEmail.set(msg.id, email)
-
-      // Track sender -> emails for contamination analysis
-      if (!senderToEmails.has(msg.sender_id)) {
-        senderToEmails.set(msg.sender_id, new Set())
-      }
-      senderToEmails.get(msg.sender_id)!.add(email)
-    } catch (err) {
-      parseFailures++
-    }
-  }
-
-  console.log(`Parsed ${formatNumber(messageToEmail.size)} messages successfully`)
-  console.log(`Parse failures: ${formatNumber(parseFailures)}`)
-  console.log(`Unique email addresses: ${formatNumber(emailToDisplayNames.size)}`)
-
-  // Step 3: Pick best display name for each email (prefer full names with spaces)
-  console.log('\nStep 3: Selecting best display name for each email...')
-
-  const emailToBestName = new Map<string, string>()
-  for (const [email, names] of emailToDisplayNames) {
-    const namesArray = [...names]
-    // Prefer names with spaces (full names), then longest name, then first one
-    const fullName = namesArray.find(n => n.includes(' '))
-    if (fullName) {
-      emailToBestName.set(email, fullName)
-    } else {
-      // No full name found - pick the longest one (usually more informative)
-      namesArray.sort((a, b) => b.length - a.length)
-      emailToBestName.set(email, namesArray[0])
-    }
-  }
-
-  // Step 4: Second pass - compute person IDs using best display names
-  console.log('\nStep 4: Computing person IDs using best display names...')
-
-  // Track: email -> person_id (one ID per email, guaranteed)
-  const emailToPersonId = new Map<string, string>()
-  // Track: message_id -> new_sender_id
-  const messageUpdates = new Map<string, string>()
-  // Track: new_person_id -> person data for creation
-  const newPeople = new Map<string, {
-    id: string
-    displayName: string
-    emails: string[]
-    firstSeen: string | null
-    lastSeen: string | null
-  }>()
-  // Track: old_sender_id -> Set of new_person_ids (for verification)
-  const senderIdMapping = new Map<string, Set<string>>()
-
-  for (const [email, bestDisplayName] of emailToBestName) {
-    const personId = createPersonId(bestDisplayName, email)
-    emailToPersonId.set(email, personId)
-
-    // Track person data (may have multiple emails mapping to same person ID)
-    if (!newPeople.has(personId)) {
-      newPeople.set(personId, {
-        id: personId,
-        displayName: bestDisplayName,
-        emails: [email],
-        firstSeen: null,
-        lastSeen: null
-      })
-    } else {
-      // Same person ID from different emails (e.g., john-smith from john.smith@a.com and john.smith@b.com)
-      newPeople.get(personId)!.emails.push(email)
-    }
-  }
-
-  // Now assign person IDs to messages
-  for (const msg of gmailMessages) {
-    const email = messageToEmail.get(msg.id)
-    if (!email) continue
-
-    const newPersonId = emailToPersonId.get(email)
-    if (!newPersonId) continue
-
-    messageUpdates.set(msg.id, newPersonId)
-
-    // Track sender_id -> person_id mapping for contamination analysis
-    if (!senderIdMapping.has(msg.sender_id)) {
-      senderIdMapping.set(msg.sender_id, new Set())
-    }
-    senderIdMapping.get(msg.sender_id)!.add(newPersonId)
-  }
-
-  console.log(`Unique person IDs: ${formatNumber(newPeople.size)}`)
-  console.log(`Messages to update: ${formatNumber(messageUpdates.size)}`)
-
-  // Show contamination analysis
-  console.log('\nContamination analysis (old IDs that mapped to multiple new IDs):')
-  let contaminatedCount = 0
-  for (const [oldId, newIds] of senderIdMapping) {
-    if (newIds.size > 1) {
-      contaminatedCount++
-      if (contaminatedCount <= 10) {
-        console.log(`  ${oldId} -> ${newIds.size} people: ${[...newIds].slice(0, 5).join(', ')}${newIds.size > 5 ? '...' : ''}`)
-      }
-    }
-  }
-  if (contaminatedCount > 10) {
-    console.log(`  ... and ${contaminatedCount - 10} more contaminated records`)
-  }
-  console.log(`Total contaminated sender IDs: ${contaminatedCount}`)
-
-  if (dryRun) {
-    console.log('\n[DRY RUN] No changes made. Remove --dry-run to execute.')
-    return
-  }
-
-  // Step 5: Create new person records
-  console.log('\nStep 5: Creating new person records...')
-  let peopleCreated = 0
-  let peopleUpdated = 0
-
-  for (const [personId, data] of newPeople) {
-    if (personId === ownerId) continue
-
-    const existing = db.query(`SELECT id, identifiers FROM people WHERE id = ?`).get(personId) as {
-      id: string
-      identifiers: string
-    } | null
-
-    if (!existing) {
-      db.query(`
-        INSERT INTO people (id, display_name, identifiers, first_seen, thread_count)
-        VALUES (?, ?, ?, datetime('now'), 0)
-      `).run(personId, data.displayName, JSON.stringify(data.emails))
-      peopleCreated++
-    } else {
-      // Add any new emails to identifiers
-      const identifiers = JSON.parse(existing.identifiers || '[]') as string[]
-      let updated = false
-      for (const email of data.emails) {
-        if (!identifiers.includes(email)) {
-          identifiers.push(email)
-          updated = true
-        }
-      }
-      if (updated) {
-        db.query(`UPDATE people SET identifiers = ? WHERE id = ?`).run(JSON.stringify(identifiers), personId)
-        peopleUpdated++
-      }
-    }
-  }
-
-  console.log(`Created ${formatNumber(peopleCreated)} new person records`)
-  console.log(`Updated ${formatNumber(peopleUpdated)} existing person records`)
-
-  // Step 6: Update messages.sender_id
-  console.log('\nStep 6: Updating message sender_ids...')
-  let messagesUpdated = 0
-
-  // Use batch updates for better performance
-  const updateStmt = db.query(`UPDATE messages SET sender_id = ? WHERE id = ?`)
-
-  for (const [msgId, newSenderId] of messageUpdates) {
-    updateStmt.run(newSenderId, msgId)
-    messagesUpdated++
-
-    if (messagesUpdated % 5000 === 0) {
-      console.log(`  Progress: ${formatNumber(messagesUpdated)} messages updated...`)
-    }
-  }
-
-  console.log(`Updated ${formatNumber(messagesUpdated)} messages`)
-
-  // Step 7: Update threads.participant_ids
-  console.log('\nStep 7: Updating thread participant_ids...')
-
-  const gmailThreads = db.query(`
-    SELECT id, participant_ids
-    FROM threads
-    WHERE source = 'gmail'
-  `).all() as Array<{ id: string; participant_ids: string }>
-
-  let threadsUpdated = 0
-
-  for (const thread of gmailThreads) {
-    const participantIds = JSON.parse(thread.participant_ids || '[]') as string[]
-
-    // Get all sender_ids for messages in this thread
-    const threadSenders = db.query(`
-      SELECT DISTINCT sender_id
-      FROM messages
-      WHERE thread_id = ?
-    `).all(thread.id) as Array<{ sender_id: string }>
-
-    const newParticipantIds = new Set<string>()
-    newParticipantIds.add(ownerId)
-
-    for (const { sender_id } of threadSenders) {
-      if (sender_id && sender_id !== ownerId) {
-        newParticipantIds.add(sender_id)
-      }
-    }
-
-    const newParticipantArray = [...newParticipantIds]
-    const oldParticipantStr = JSON.stringify(participantIds.sort())
-    const newParticipantStr = JSON.stringify(newParticipantArray.sort())
-
-    if (oldParticipantStr !== newParticipantStr) {
-      db.query(`UPDATE threads SET participant_ids = ? WHERE id = ?`)
-        .run(JSON.stringify(newParticipantArray), thread.id)
-      threadsUpdated++
-    }
-  }
-
-  console.log(`Updated ${formatNumber(threadsUpdated)} threads`)
-
-  // Step 8: Update thread counts for all Gmail people
-  console.log('\nStep 8: Updating thread counts...')
-
-  for (const [personId] of newPeople) {
-    if (personId === ownerId) continue
-
-    const count = db.query(`
-      SELECT COUNT(DISTINCT t.id) as count
-      FROM threads t
-      WHERE t.participant_ids LIKE ?
-    `).get(`%"${personId}"%`) as { count: number }
-
-    db.query(`UPDATE people SET thread_count = ? WHERE id = ?`).run(count.count, personId)
-  }
-
-  // Step 9: Find and report orphaned people records
-  console.log('\nStep 9: Finding orphaned people records...')
-
-  const orphanedPeople = db.query(`
-    SELECT p.id, p.display_name
-    FROM people p
-    WHERE p.id NOT IN (
-      SELECT DISTINCT sender_id FROM messages WHERE sender_id IS NOT NULL
-    )
-    AND p.id NOT IN (
-      SELECT DISTINCT json_each.value
-      FROM threads, json_each(threads.participant_ids)
-    )
-    AND p.id != '${OWNER_CONFIG.personId}'
-  `).all() as Array<{ id: string; display_name: string }>
-
-  if (orphanedPeople.length > 0) {
-    console.log(`Found ${orphanedPeople.length} orphaned people records that can be deleted:`)
-    for (const p of orphanedPeople.slice(0, 10)) {
-      console.log(`  ${p.id} (${p.display_name})`)
-    }
-    if (orphanedPeople.length > 10) {
-      console.log(`  ... and ${orphanedPeople.length - 10} more`)
-    }
-
-    // Delete orphaned records
-    for (const p of orphanedPeople) {
-      db.query(`DELETE FROM people WHERE id = ?`).run(p.id)
-      db.query(`DELETE FROM contact_links WHERE person_id = ?`).run(p.id)
-      db.query(`DELETE FROM contact_suggestions WHERE person_id_1 = ? OR person_id_2 = ?`).run(p.id, p.id)
-    }
-    console.log(`Deleted ${orphanedPeople.length} orphaned records`)
-  } else {
-    console.log('No orphaned people records found')
-  }
-
-  console.log('\n═══════════════════════════════════════════════════════════════')
-  console.log('                         SUMMARY')
-  console.log('═══════════════════════════════════════════════════════════════')
-  console.log(`✓ Messages processed: ${formatNumber(gmailMessages.length)}`)
-  console.log(`✓ New person records created: ${formatNumber(peopleCreated)}`)
-  console.log(`✓ Person records updated: ${formatNumber(peopleUpdated)}`)
-  console.log(`✓ Messages updated: ${formatNumber(messagesUpdated)}`)
-  console.log(`✓ Threads updated: ${formatNumber(threadsUpdated)}`)
-  console.log(`✓ Orphaned records deleted: ${formatNumber(orphanedPeople.length)}`)
-  console.log(`✓ Contaminated sender IDs fixed: ${formatNumber(contaminatedCount)}`)
-
-  console.log('\nRun "deep-context contacts analyze" to verify the fix.')
-}
-
-async function contactsAutoAccept(db: Database, args: ParsedArgs): Promise<void> {
-  const minConfidence = args.flags['min-confidence']
-    ? parseFloat(args.flags['min-confidence'] as string)
-    : 0.95
-  const dryRun = args.flags['dry-run']
-
-  console.log('═══════════════════════════════════════════════════════════════')
-  console.log('            AUTO-ACCEPT HIGH CONFIDENCE SUGGESTIONS')
-  console.log('═══════════════════════════════════════════════════════════════\n')
-
-  console.log(`Minimum confidence: ${Math.round(minConfidence * 100)}%`)
-  if (dryRun) console.log('[DRY RUN]\n')
-
-  // Get all pending suggestions above threshold
-  const suggestions = db.query(`
-    SELECT cs.*, p1.display_name as name1, p2.display_name as name2
-    FROM contact_suggestions cs
-    JOIN people p1 ON cs.person_id_1 = p1.id
-    JOIN people p2 ON cs.person_id_2 = p2.id
-    WHERE cs.status = 'pending'
-      AND cs.confidence >= ?
-    ORDER BY cs.confidence DESC
-  `).all(minConfidence) as Array<{
-    id: number
-    person_id_1: string
-    person_id_2: string
-    confidence: number
-    match_signals: string
-    name1: string
-    name2: string
-  }>
-
-  console.log(`Found ${formatNumber(suggestions.length)} suggestions with confidence >= ${Math.round(minConfidence * 100)}%`)
-
-  if (suggestions.length === 0) {
-    console.log('\nNo suggestions to auto-accept.')
-    return
-  }
-
-  // Show confidence distribution within the batch
-  const bands: Record<string, number> = { '99%+': 0, '97-99%': 0, '95-97%': 0, '90-95%': 0 }
-  for (const s of suggestions) {
-    if (s.confidence >= 0.99) bands['99%+']++
-    else if (s.confidence >= 0.97) bands['97-99%']++
-    else if (s.confidence >= 0.95) bands['95-97%']++
-    else bands['90-95%']++
-  }
-  console.log('\nConfidence distribution:')
-  for (const [band, count] of Object.entries(bands)) {
-    if (count > 0) console.log(`  ${band.padEnd(8)} ${formatNumber(count).padStart(6)}`)
-  }
-
-  let accepted = 0
-  let skipped = 0
-  let errors = 0
-
-  console.log('\nProcessing...')
-
-  for (const suggestion of suggestions) {
-    // Check if either person is an automated sender
-    const p1 = db.query(`SELECT * FROM people WHERE id = ?`).get(suggestion.person_id_1) as PersonRecord | null
-    const p2 = db.query(`SELECT * FROM people WHERE id = ?`).get(suggestion.person_id_2) as PersonRecord | null
-
-    if (!p1 || !p2) {
-      console.log(`  Skipping: Person record missing for ${suggestion.person_id_1} or ${suggestion.person_id_2}`)
-      errors++
-      continue
-    }
-
-    if (isAutomatedSender(p1) || isAutomatedSender(p2)) {
-      skipped++
-      continue
-    }
-
-    if (dryRun) {
-      const conf = Math.round(suggestion.confidence * 100)
-      console.log(`  [${conf}%] Would accept: ${suggestion.name1} ↔ ${suggestion.name2}`)
-      accepted++
-      continue
-    }
-
-    try {
-      // Create or extend unified contact
-      const signals = JSON.parse(suggestion.match_signals || '[]') as MatchSignal[]
-      const unifiedId = await createOrExtendUnifiedContact(db, suggestion.person_id_1, suggestion.person_id_2, {
-        signals,
-        confidence: suggestion.confidence,
-        linkType: 'auto'
-      })
-
-      // Mark suggestion as accepted
-      db.query(`
-        UPDATE contact_suggestions
-        SET status = 'accepted', reviewed_at = datetime('now')
-        WHERE id = ?
-      `).run(suggestion.id)
-
-      accepted++
-
-      if (accepted % 50 === 0) {
-        console.log(`  Progress: ${formatNumber(accepted)} accepted...`)
-      }
-    } catch (err) {
-      console.log(`  Error accepting ${suggestion.person_id_1} ↔ ${suggestion.person_id_2}: ${(err as Error).message}`)
-      errors++
-    }
-  }
-
-  console.log('\n═══════════════════════════════════════════════════════════════')
-  console.log('                         SUMMARY')
-  console.log('═══════════════════════════════════════════════════════════════')
-  console.log(`✓ Accepted: ${formatNumber(accepted)}`)
-  console.log(`○ Skipped (automated senders): ${formatNumber(skipped)}`)
-  if (errors > 0) console.log(`✗ Errors: ${formatNumber(errors)}`)
-
-  if (dryRun) {
-    console.log('\n[DRY RUN] No changes made. Remove --dry-run to execute.')
-  } else {
-    console.log('\nRun "deep-context contacts status" to see updated counts.')
-  }
-}
-
-async function contactsEnrichTwitter(db: Database, args: ParsedArgs): Promise<void> {
-  const dryRun = args.flags['dry-run']
-
-  console.log('═══════════════════════════════════════════════════════════════')
-  console.log('          ENRICH TWITTER PEOPLE WITH USERNAMES')
-  console.log('═══════════════════════════════════════════════════════════════\n')
-
-  if (dryRun) console.log('[DRY RUN]\n')
-
-  // Load config for archive path
-  const config = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
-  const archivePath = config.extraction?.twitter?.archive_path
-
-  if (!archivePath) {
-    console.error('Error: Twitter archive path not configured')
-    console.error('Add to config.json: extraction.twitter.archive_path')
-    return
-  }
-
-  if (!existsSync(archivePath)) {
-    console.log(`  Skipping archive mention scan (not present at ${archivePath})`)
-    return
-  }
-
-  // Parse tweets.js for user mentions
-  const tweetsPath = join(archivePath, 'data/tweets.js')
-  if (!existsSync(tweetsPath)) {
-    console.error(`Error: tweets.js not found at: ${tweetsPath}`)
-    return
-  }
-
-  console.log('Parsing tweets.js for user mentions...')
-
-  let tweetsContent = readFileSync(tweetsPath, 'utf8')
-  tweetsContent = tweetsContent.replace(/^window\.YTD\.tweets\.part\d+\s*=\s*/, '')
-  const tweets = JSON.parse(tweetsContent) as Array<{
-    tweet: {
-      entities?: {
-        user_mentions?: Array<{
-          id_str: string
-          screen_name: string
-          name?: string
-        }>
-      }
-    }
-  }>
-
-  console.log(`Found ${formatNumber(tweets.length)} tweets`)
-
-  // Build user ID -> username mapping from mentions
-  const idToUsername = new Map<string, string>()
-  const idToDisplayName = new Map<string, string>()
-
-  for (const item of tweets) {
-    const mentions = item.tweet.entities?.user_mentions || []
-    for (const mention of mentions) {
-      if (mention.id_str && mention.screen_name) {
-        // Keep the most recent/common screen name for each ID
-        idToUsername.set(mention.id_str, mention.screen_name.toLowerCase())
-        if (mention.name && !idToDisplayName.has(mention.id_str)) {
-          idToDisplayName.set(mention.id_str, mention.name)
-        }
-      }
-    }
-  }
-
-  console.log(`Found ${formatNumber(idToUsername.size)} unique user ID -> username mappings`)
-
-  // Also parse DMs for additional mappings
-  const dmsPath = join(archivePath, 'data/direct-messages.js')
-  if (existsSync(dmsPath)) {
-    console.log('\nParsing direct-messages.js...')
-    let dmsContent = readFileSync(dmsPath, 'utf8')
-    dmsContent = dmsContent.replace(/^window\.YTD\.direct_messages\.part\d+\s*=\s*/, '')
-    try {
-      const dms = JSON.parse(dmsContent) as Array<{
-        dmConversation: {
-          messages: Array<{
-            messageCreate?: {
-              senderId: string
-              recipientId: string
-            }
-          }>
-        }
-      }>
-
-      // DMs don't include usernames directly, but we can track seen IDs
-      const dmUserIds = new Set<string>()
-      for (const convo of dms) {
-        for (const msg of convo.dmConversation.messages) {
-          if (msg.messageCreate) {
-            dmUserIds.add(msg.messageCreate.senderId)
-            dmUserIds.add(msg.messageCreate.recipientId)
-          }
-        }
-      }
-      console.log(`Found ${formatNumber(dmUserIds.size)} unique user IDs in DMs`)
-    } catch {
-      console.log('Could not parse direct-messages.js')
-    }
-  }
-
-  // Get Twitter people records that need updating
-  const twitterPeople = db.query(`
-    SELECT id, display_name, identifiers
-    FROM people
-    WHERE id LIKE 'twitter-user-%'
-  `).all() as Array<{
-    id: string
-    display_name: string
-    identifiers: string | null
-  }>
-
-  console.log(`\nFound ${formatNumber(twitterPeople.length)} Twitter people records`)
-
-  let updated = 0
-  let alreadyHasUsername = 0
-  let noMatchFound = 0
-
-  for (const person of twitterPeople) {
-    // Extract user ID from person ID
-    const userId = person.id.replace('twitter-user-', '')
-    const username = idToUsername.get(userId)
-    const displayName = idToDisplayName.get(userId)
-
-    // Parse existing identifiers
-    let identifiers: string[] = []
-    try {
-      identifiers = JSON.parse(person.identifiers || '[]')
-    } catch {
-      identifiers = []
-    }
-
-    // Check if already has username (filter nulls)
-    const hasUsername = identifiers.some(id => id && id.startsWith('@'))
-    if (hasUsername) {
-      alreadyHasUsername++
-      continue
-    }
-
-    if (!username) {
-      noMatchFound++
-      continue
-    }
-
-    // Add username to identifiers
-    const newIdentifiers = [...identifiers, `@${username}`]
-    const newDisplayName = displayName && person.display_name.startsWith('Twitter User ')
-      ? displayName
-      : person.display_name
-
-    if (dryRun) {
-      console.log(`  Would update: ${person.display_name} -> @${username}`)
-      updated++
-      continue
-    }
-
-    db.query(`
-      UPDATE people
-      SET identifiers = ?, display_name = ?
-      WHERE id = ?
-    `).run(JSON.stringify(newIdentifiers), newDisplayName, person.id)
-    updated++
-
-    if (updated % 100 === 0) {
-      console.log(`  Progress: ${formatNumber(updated)} updated...`)
-    }
-  }
-
-  console.log('\n═══════════════════════════════════════════════════════════════')
-  console.log('                         SUMMARY')
-  console.log('═══════════════════════════════════════════════════════════════')
-  console.log(`✓ Updated with usernames: ${formatNumber(updated)}`)
-  console.log(`○ Already has username: ${formatNumber(alreadyHasUsername)}`)
-  console.log(`○ No username mapping found: ${formatNumber(noMatchFound)}`)
-
-  if (dryRun) {
-    console.log('\n[DRY RUN] No changes made. Remove --dry-run to execute.')
-  } else {
-    console.log('\nRun "deep-context contacts suggest" to generate new match suggestions.')
-  }
-}
-
-async function contactsEnrichSlack(db: Database, args: ParsedArgs): Promise<void> {
-  const dryRun = args.flags['dry-run']
-  const slackToolPath = join(PROJECT_ROOT, 'tools/slack.ts')
-
-  console.log('═══════════════════════════════════════════════════════════════')
-  console.log('         ENRICH SLACK USERS WITH EMAIL ADDRESSES')
-  console.log('═══════════════════════════════════════════════════════════════\n')
-
-  if (dryRun) console.log('[DRY RUN]\n')
-
-  if (!existsSync(slackToolPath)) {
-    console.error('Error: slack.ts tool not found')
-    return
-  }
-
-  // Ensure slack_user_cache table exists (with retry for locked database)
-  await withDbRetry(() => {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS slack_user_cache (
-        workspace TEXT NOT NULL,
-        user_id TEXT NOT NULL,
-        email TEXT,
-        display_name TEXT,
-        real_name TEXT,
-        fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (workspace, user_id)
-      )
-    `)
-  })
-
-  // Get unique Slack user IDs with workspace context from thread_id
-  // This is more efficient than trying all users against all workspaces
-  // Build dynamic CASE statement from configured workspaces
-  const workspaceFlags = Object.keys(OWNER_CONFIG.slackIdentifiers)
-  const workspaceCaseClauses = workspaceFlags.map(flag =>
-    `WHEN thread_id LIKE 'slack:${flag}:%' OR thread_id LIKE 'slack-dm:${flag}:%' THEN '${flag}'`
-  ).join('\n        ')
-
-  const slackSendersWithWorkspace = await withDbRetry(() => db.query(`
-    SELECT DISTINCT
-      sender_id,
-      CASE
-        ${workspaceCaseClauses || "WHEN 1=0 THEN NULL -- no workspaces configured"}
-        ELSE NULL
-      END as workspace
-    FROM messages
-    WHERE source IN ('slack', 'slack-dm')
-      AND is_from_me = 0
-      AND sender_id IS NOT NULL
-      AND sender_id != '${OWNER_CONFIG.personId}'
-      AND sender_id GLOB 'U[A-Z0-9]*'
-  `).all() as Array<{ sender_id: string; workspace: string | null }>)
-
-  // Group by workspace for efficient processing
-  const byWorkspace = new Map<string, string[]>()
-  for (const row of slackSendersWithWorkspace) {
-    if (!row.workspace) continue
-    if (!byWorkspace.has(row.workspace)) {
-      byWorkspace.set(row.workspace, [])
-    }
-    const list = byWorkspace.get(row.workspace)!
-    if (!list.includes(row.sender_id)) {
-      list.push(row.sender_id)
-    }
-  }
-
-  const totalUsers = Array.from(byWorkspace.values()).reduce((sum, arr) => sum + arr.length, 0)
-  console.log(`Found ${formatNumber(totalUsers)} unique Slack sender IDs across workspaces\n`)
-
-  let enriched = 0
-  let cached = 0
-  let failed = 0
-  let alreadyHasEmail = 0
-  let peopleUpdated = 0
-  let peopleCreated = 0
-
-  for (const workspace of SLACK_WORKSPACES) {
-    const workspaceUserIds = byWorkspace.get(workspace.flag) || []
-    if (workspaceUserIds.length === 0) {
-      console.log(`\n--- ${workspace.name}: No users to process ---`)
-      continue
-    }
-
-    console.log(`\n--- Processing ${workspace.name} (${workspaceUserIds.length} users) ---`)
-
-    let workspaceEnriched = 0
-
-    for (let i = 0; i < workspaceUserIds.length; i++) {
-      const userId = workspaceUserIds[i]
-
-      // Check if already in cache for this workspace (with retry for locked database)
-      const cachedUser = await withDbRetry(() => db.query(`
-        SELECT email, real_name, display_name FROM slack_user_cache
-        WHERE workspace = ? AND user_id = ?
-      `).get(workspace.flag, userId) as { email: string | null; real_name: string | null; display_name: string | null } | null)
-
-      if (cachedUser) {
-        if (cachedUser.email) {
-          alreadyHasEmail++
-        }
-        cached++
-        continue
-      }
-
-      // Fetch from API
-      const result = await fetchSlackUserEmail(db, slackToolPath, workspace.flag, userId, dryRun)
-
-      // Check if we got useful data (email OR name)
-      const hasEmail = result.email && result.email.trim() !== ''
-      const hasName = result.displayName && result.displayName.trim() !== ''
-
-      if (hasEmail || hasName) {
-        if (hasEmail) {
-          console.log(`  ${userId}: ${result.displayName || 'Unknown'} <${result.email}>`)
-        } else {
-          console.log(`  ${userId}: ${result.displayName} (no email - Slack bot may need users:read.email scope)`)
-        }
-
-        if (!dryRun) {
-          const slackIdentifier = `slack:${workspace.flag}:${userId}`
-
-          // Wrap all database operations in retry for locked database
-          const updateResult = await withDbRetry(() => {
-            if (hasEmail) {
-              // Strategy: Look for existing people record by EMAIL (not Slack ID)
-              // This allows contact unification to link Slack users to Gmail/other records
-              const personByEmail = db.query(`
-                SELECT id, display_name, identifiers FROM people
-                WHERE identifiers LIKE ?
-              `).get(`%${result.email}%`) as {
-                id: string
-                display_name: string
-                identifiers: string | null
-              } | null
-
-              if (personByEmail) {
-                // Found existing person with this email - add Slack user ID to identifiers
-                let identifiers: string[] = []
-                try {
-                  identifiers = JSON.parse(personByEmail.identifiers || '[]')
-                } catch {
-                  identifiers = []
-                }
-
-                // Add Slack user ID as identifier if not present
-                if (!identifiers.includes(slackIdentifier)) {
-                  identifiers.push(slackIdentifier)
-                  db.query(`UPDATE people SET identifiers = ? WHERE id = ?`)
-                    .run(JSON.stringify(identifiers), personByEmail.id)
-                  return { updated: true, created: false }
-                }
-
-                // Update display_name if currently empty and we have a name
-                if ((!personByEmail.display_name || personByEmail.display_name === '') && hasName) {
-                  db.query(`UPDATE people SET display_name = ? WHERE id = ?`)
-                    .run(result.displayName, personByEmail.id)
-                }
-                return { updated: false, created: false }
-              } else {
-                // No existing person with this email - create new person record
-                const personId = userId  // Use Slack user ID as person ID
-                const identifiers = [result.email, slackIdentifier]
-
-                db.query(`
-                  INSERT OR IGNORE INTO people (id, display_name, identifiers, first_seen)
-                  VALUES (?, ?, ?, datetime('now'))
-                `).run(personId, result.displayName || userId, JSON.stringify(identifiers))
-                return { updated: false, created: true }
-              }
-            } else {
-              // No email, but we have a name - create/update people record with Slack identifier only
-              // Check if person already exists with this Slack ID
-              const existingPerson = db.query(`
-                SELECT id, display_name, identifiers FROM people
-                WHERE id = ? OR identifiers LIKE ?
-              `).get(userId, `%${slackIdentifier}%`) as {
-                id: string
-                display_name: string
-                identifiers: string | null
-              } | null
-
-              if (existingPerson) {
-                // Update display_name if empty
-                if ((!existingPerson.display_name || existingPerson.display_name === '') && hasName) {
-                  db.query(`UPDATE people SET display_name = ? WHERE id = ?`)
-                    .run(result.displayName, existingPerson.id)
-                  return { updated: true, created: false }
-                }
-                return { updated: false, created: false }
-              } else {
-                // Create new person with Slack identifier only
-                const identifiers = [slackIdentifier]
-                db.query(`
-                  INSERT OR IGNORE INTO people (id, display_name, identifiers, first_seen)
-                  VALUES (?, ?, ?, datetime('now'))
-                `).run(userId, result.displayName || userId, JSON.stringify(identifiers))
-                return { updated: false, created: true }
-              }
-            }
-          })
-
-          if (updateResult.updated) peopleUpdated++
-          if (updateResult.created) peopleCreated++
-        }
-
-        if (hasEmail) {
-          enriched++
-          workspaceEnriched++
-        } else {
-          // Still count as enriched if we got a name (better than nothing)
-          enriched++
-          workspaceEnriched++
-        }
-      } else {
-        failed++
-      }
-
-      // Rate limiting - be gentle with Slack API
-      if ((i + 1) % 50 === 0) {
-        console.log(`    Progress: ${i + 1}/${workspaceUserIds.length}...`)
-        await slackSleep(2000) // Extra pause every 50 users
-      } else {
-        await slackSleep(500) // Brief pause between requests
-      }
-    }
-
-    console.log(`  ${workspace.name}: Enriched ${workspaceEnriched} users`)
-  }
-
-  console.log('\n═══════════════════════════════════════════════════════════════')
-  console.log('                         SUMMARY')
-  console.log('═══════════════════════════════════════════════════════════════')
-  console.log(`✓ Users fetched from API: ${formatNumber(enriched)}`)
-  console.log(`✓ People records updated: ${formatNumber(peopleUpdated)}`)
-  console.log(`✓ People records created: ${formatNumber(peopleCreated)}`)
-  console.log(`○ Already cached: ${formatNumber(cached)}`)
-  console.log(`○ Already has email: ${formatNumber(alreadyHasEmail)}`)
-  console.log(`○ API call failed: ${formatNumber(failed)}`)
-
-  if (failed > 0 && enriched === 0) {
-    console.log('\n⚠️  Note: If no emails were found, your Slack bot tokens may need')
-    console.log('   the "users:read.email" scope. Add it at api.slack.com/apps.')
-    console.log('   Names are still cached and people records created.')
-  }
-
-  if (dryRun) {
-    console.log('\n[DRY RUN] No changes made. Remove --dry-run to execute.')
-  } else {
-    console.log('\nRun "deep-context contacts suggest" to generate new match suggestions.')
-  }
-}
-
-// ============================================================
 // SEMANTIC EMBEDDINGS (sidecar vector DB — deep_context_vectors_<provider>.db)
 // ============================================================
 // Embeddings: Gemini gemini-embedding-2 (default) or local Ollama. Index: sqlite-vec vec0.
@@ -11484,7 +8428,7 @@ async function cmdEmbedBackfill(args: ParsedArgs): Promise<void> {
   const toDate = args.flags.to as string | undefined
   const chunkLimit = args.flags.limit as number | undefined
   const dryRun = !!args.flags['dry-run']
-  const batchSize = args.flags['batch-size'] ? parseInt(args.flags['batch-size'] as string, 10) : DEFAULT_BATCH_SIZE
+  const batchSize = DEFAULT_BATCH_SIZE
   const maxCost = args.flags['max-cost'] ? parseFloat(args.flags['max-cost'] as string) : undefined
 
   // Resolve the provider + key BEFORE creating any files, so an unconfigured install
@@ -11776,12 +8720,8 @@ async function main(): Promise<void> {
     from: { type: 'string' as const },
     to: { type: 'string' as const },
     limit: { type: 'string' as const, alias: 'l' },
-    person: { type: 'string' as const },
-    project: { type: 'string' as const },
-    format: { type: 'string' as const },
     output: { type: 'string' as const, alias: 'o' },
     'token-budget': { type: 'string' as const },
-    overlap: { type: 'string' as const },
     'include-low-quality': { type: 'boolean' as const },
     force: { type: 'boolean' as const },
     'dry-run': { type: 'boolean' as const },
@@ -11791,14 +8731,7 @@ async function main(): Promise<void> {
     // resolve_account() in _lib/google_oauth; declared here so the parser
     // accepts it. e.g. `extract gmail --account travel`
     account: { type: 'string' as const },
-    as: { type: 'string' as const },
-    // Contacts command flags
-    'use-llm': { type: 'boolean' as const },
-    'min-confidence': { type: 'string' as const },
-    'auto-accept': { type: 'string' as const },
-    name: { type: 'string' as const },
-    'high-interaction': { type: 'boolean' as const },
-    'min-domains': { type: 'string' as const },
+    as: { type: 'string' as const },  // alias of --account
     'extracted-since': { type: 'string' as const },
     // Recent command flags
     hours: { type: 'string' as const },
@@ -11812,10 +8745,8 @@ async function main(): Promise<void> {
     priority: { type: 'string' as const },
     tags: { type: 'string' as const },
     context: { type: 'string' as const },
-    'source-message-id': { type: 'string' as const },
-    'source-thread-id': { type: 'string' as const },
-    'source-url': { type: 'string' as const },
     since: { type: 'string' as const },
+    days: { type: 'string' as const },  // todo expire --days N (default 30)
     // Slack extraction flags
     channel: { type: 'string' as const },
     // Backfill flags
@@ -11827,7 +8758,6 @@ async function main(): Promise<void> {
     semantic: { type: 'boolean' as const },
     hybrid: { type: 'boolean' as const },
     'no-rerank': { type: 'boolean' as const },
-    'batch-size': { type: 'string' as const },
     'max-cost': { type: 'string' as const },
   }
 
@@ -11870,9 +8800,6 @@ async function main(): Promise<void> {
     case 'enrich':
       await cmdEnrich(cmdArgs)
       break
-    case 'synthesize':
-      await cmdSynthesize(cmdArgs)
-      break
     case 'query':
       await cmdQuery(cmdArgs)
       break
@@ -11882,38 +8809,14 @@ async function main(): Promise<void> {
     case 'todo':
       await cmdTodo(cmdArgs)
       break
-    case 'export':
-      await cmdExport(cmdArgs)
-      break
     case 'export-public':
       await cmdExportPublic(cmdArgs)
       break
     case 'extract-for-summary':
       await cmdExtractForSummary(cmdArgs)
       break
-    case 'update':
-      await cmdUpdate(cmdArgs)
-      break
-    case 'patch-html-emails':
-      await cmdPatchHtmlEmails(cmdArgs)
-      break
-    case 'patch-slack-mentions':
-      await cmdPatchSlackMentions(cmdArgs)
-      break
     case 'backfill':
       await cmdBackfill(cmdArgs)
-      break
-    case 'contacts':
-      await cmdContacts(cmdArgs)
-      break
-    case 'migrate-twitter-threads':
-      await cmdMigrateTwitterThreads(cmdArgs)
-      break
-    case 'hydrate-twitter-stubs':
-      await cmdHydrateTwitterStubs(cmdArgs)
-      break
-    case 'dedup-beeper-imessage':
-      await cmdDedupBeeperImessage(cmdArgs)
       break
     case 'embed-backfill':
     case 'embed-update':
