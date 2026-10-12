@@ -12,7 +12,7 @@ All tools are Bun/TypeScript. Run with `bun tools/<tool>.ts` or `~/.bun/bin/bun 
 
 | Tool | Command | Purpose |
 |------|---------|---------|
-| Deep Context | `bun tools/deep-context.ts` | Main CLI: extract (incl. GroupMe), enrich, query (keyword/semantic/hybrid), recent, todo, embed, export-public, contacts |
+| Deep Context | `bun tools/deep-context.ts` | Main CLI: extract (incl. GroupMe), enrich, query (keyword/semantic/hybrid), recent, todo, embed, extract-for-summary, export-public |
 | Semantic | `tools/deep-context-semantic.ts` | Embeddings (Gemini or local Ollama), sqlite-vec sidecar, optional Voyage rerank (library, used by deep-context) |
 | Dropped balls | `bun tools/dropped-balls.ts` | Email threads awaiting your reply (last message inbound) |
 | Cron wrapper | `tools/deep-context-cron.sh` | Scheduled refresh run by your Claude Code / Codex subscription |
@@ -45,19 +45,20 @@ All tools are Bun/TypeScript. Run with `bun tools/<tool>.ts` or `~/.bun/bin/bun 
 | `threads` | Conversation containers (email threads, chats, tweet threads, calls) |
 | `messages` | Individual messages within threads |
 | `people` | Contacts extracted from communications |
-| `message_metadata` | AI-enriched metadata (quality, topics, sentiment, originality, etc.) |
-| `syntheses` | Generated summaries (timelines, relationships, projects) |
+| `message_metadata` | Optional AI metadata on the owner's messages: quality / authorship / originality scores, topics, entities |
 | `todo_items` | Action items auto-detected from messages |
-| `unified_contacts` | Deduplicated contact records |
-| `contact_links` | Maps `people` records to `unified_contacts` |
-| `extraction_log` | Tracks when each source was last extracted |
+| `extraction_log` / `extraction_watermarks` | When each source was last extracted (and backfill checkpoints) |
+| `slack_user_cache` | Slack user ID → name/email, used to resolve `<@U…>` mentions at extract time |
+
+Older DBs may also contain `syntheses`, `projects`, `unified_contacts`, `contact_links`,
+`contact_suggestions`, and extra `message_metadata` / `threads.enriched_*` columns from
+earlier versions. Nothing reads or writes them any more, and nothing drops them.
 
 ### Useful Views
 
 - `v_my_messages` -- Owner's messages with thread context
 - `v_people_ranked` -- Contacts ranked by interaction volume
 - `v_extraction_status` -- Last extraction time per source
-- `v_unified_people` -- Combined unified + unlinked contacts
 
 ## Key Patterns
 
@@ -114,7 +115,8 @@ All secrets live in `tools/.env`. The env loader (`_lib/env.ts`) searches multip
 - Processes only the owner's messages (`is_from_me = 1`); prompt/schema v2 marks each batch's messages `[MSG n]` and maps indexes back to IDs in code.
 - Robustness: up to 3 retries per batch (truncated structured output), context windowing for very large threads, per-batch writes (an interrupted run keeps its progress), skips rows already enriched by the current model.
 - All enrichment schema fields must be marked `required` (Gemini silently drops optional fields).
-- Scope scheduled runs with `--from <date>` (last_activity_at). Avoid `--extracted-since`: `extracted_at` is set only on insert, so it misses new replies in existing threads.
+- Fields: `quality_score`, `originality_score` (both feed `extract-for-summary`'s low-quality / AI-written filter), `authorship_score`, `topics`, `entities`. That's deliberately all: the 2026-10 usage audit found nothing reading domain/sentiment/engagement/actionability/style/thread-role fields, so they are no longer generated.
+- Scope scheduled runs with `--from <date>` (last_activity_at). `--extracted-since` is a deprecated alias for `--from`.
 
 ### Semantic search (optional)
 
@@ -127,14 +129,6 @@ All secrets live in `tools/.env`. The env loader (`_lib/env.ts`) searches multip
 ### Wiki Layer
 
 On top of the raw DB, the `summarize-monthly` and `wiki` skills build narrative monthly summaries and a two-repo (shared `wiki/` + private `data/deep_context/wiki-private/`) knowledge wiki. Engine: `tools/summarize.ts`. Index builder: `wiki/_build_index.ts`. Full architecture and setup: `WIKI.md`. The shared wiki is always *derived* from the private one by stripping source pointers, financials, medical specifics, and Private Notes.
-
-### Contact Unification
-
-Multi-stage dedup pipeline:
-1. `contacts suggest` -- heuristic + optional LLM matching to find duplicate people
-2. `contacts review` -- interactive review of suggestions
-3. `contacts auto-accept --min-confidence 0.99` -- batch accept high-confidence matches
-4. `contacts link` / `contacts reject` -- manual overrides
 
 ## Conventions
 
@@ -161,15 +155,11 @@ deep-context query "term" [--source S]         # Keyword search across all sourc
 deep-context query "idea" --semantic|--hybrid  # Meaning-based search (needs embedding provider)
 deep-context embed-update | embed-status       # Maintain the semantic index
 deep-context recent --hours N                  # Browse recent threads
-deep-context synthesize <type>                 # Generate summaries
-deep-context export <type> --output FILE       # Export data
 deep-context extract-for-summary               # Generate LLM-ready summary doc
 deep-context todo list|add|update|expire|recap|strategic   # Action item tracking
 deep-context export-public [--push user@host:dir]          # Public-only FTS5 DB for low-access agents
 bun tools/dropped-balls.ts --days 30                       # Email awaiting your reply
-deep-context contacts <subcommand>             # Contact unification
-deep-context patch-html-emails                 # Clean up HTML email content
-deep-context patch-slack-mentions              # Resolve Slack @mentions
+deep-context backfill slack <mentions|channel-full> --from DATE   # Resumable multi-year Slack load (setup)
 ```
 
 ## Setup Guidance

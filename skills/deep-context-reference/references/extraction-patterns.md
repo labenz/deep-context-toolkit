@@ -27,7 +27,7 @@ deep-context extract gmail [--from DATE]
 
 **Known issues:**
 - **Auth tokens expire after ~1 hour.** The tool now auto-refreshes via `try_refresh_token` and persists the new token. Previously returned stale tokens from `.env` without refreshing, causing 401s on cron runs. The fix: refresh -> persist -> use.
-- HTML emails may contain raw HTML markup. Use `patch-html-emails` to convert existing ones to plain text.
+- HTML-only emails are converted to plain text at extract time (`html-to-text`).
 
 ---
 
@@ -42,7 +42,7 @@ deep-context extract slack [--from DATE]
 - Extracts from configured workspace channels.
 
 **Post-processing:**
-- Slack messages contain user mention tokens like `<@U12345>`. Use `patch-slack-mentions` to resolve these to `@DisplayName` using the cached user data in the `slack_user_cache` table.
+- Slack user mention tokens like `<@U12345>` are resolved to `@DisplayName` at extract time, using the `slack_user_cache` table.
 
 ---
 
@@ -77,9 +77,6 @@ deep-context extract beeper [--backfill]
 **Privacy filtering:**
 - Certain contacts are excluded from all queries per `beeper-config.json`. Uses `mode: "entire_chat"` to filter both directions.
 
-**Dedup maintenance:**
-- One-time `dedup-beeper-imessage` command removed 13,865 duplicate beeper iMessage messages that overlapped with native import. Reduced beeper iMessage threads from 1,198 to 135.
-
 ---
 
 ## Twitter
@@ -92,11 +89,11 @@ deep-context extract twitter [--from DATE]
 ```
 Imports from a downloaded Twitter archive (data export). Processes tweets, retweets, quote tweets, and reply context.
 
-**Thread handling (Feb 2026 migration):**
+**Thread handling:**
 - Self-reply chains are grouped into proper threads with `thread_type='thread'`.
 - Parent tweet stubs are added for replies to others, providing conversation context at `position_in_thread=0`. These threads keep `thread_type='standalone'`.
 - Branching self-reply chains exist: when you reply to the same tweet multiple times, the tree is flattened by timestamp (`timestamp ASC`), not depth.
-- Stubs are hydrated from `like.js` archive (~48K liked tweets, ~47.6% hit rate). Run `hydrate-twitter-stubs` to fill remaining placeholders.
+- Parent-tweet stubs are filled from the archive's `like.js` when the parent is a tweet you liked.
 
 ### Live Extraction
 ```bash
@@ -139,12 +136,12 @@ deep-context enrich --dry-run                          # Preview without writing
 
 **What enrichment does:**
 - Processes the owner's messages only (`is_from_me = 1`)
-- Uses Gemini to generate: quality score (1-7), authorship score (0-1), originality score (1-7), topics, domain, sentiment (-1 to 1), engagement (1-7), actionability (1-7), style tags, entities, thread role, relationship dynamic
+- Uses Gemini to generate: quality score (1-7), authorship score (0-1), originality score (1-7), topics, entities. (Earlier versions also produced domain/sentiment/engagement/actionability/style/thread-role fields; nothing read them, so they were dropped in 2026-10.)
 - Sends full thread context (not just the single message) so Gemini understands conversation flow
 - Writes to `message_metadata` table
-- Skips already-enriched messages (checks `message_metadata` for existing entries)
+- Skips messages already enriched by the current model (`message_metadata.processor_model`)
 - Optional: needs `GEMINI_API_KEY`; without one `enrich` prints a note and exits cleanly
-- Prefer `--from` over `--extracted-since`: `extracted_at` is set only on insert, so `--extracted-since` misses new replies in existing threads
+- Scope with `--from` (thread activity). `--extracted-since` is a deprecated alias for it.
 
 **Enrichment model:** `gemini-3.7-flash` by default (override with `DEEP_CONTEXT_ENRICH_MODEL` or `enrichment.model` in config.json). Messages are marked `[MSG n]` per batch; failed/truncated batches retry up to 3x; huge threads get a windowed context; each batch is written as soon as it returns.
 
@@ -156,7 +153,4 @@ If you schedule it (see `tools/deep-context-cron.sh`), a typical cadence is:
 - **2-3x daily** for core sources (Gmail, Slack, Beeper, Twitter-live), followed by `embed-update`
 - **TODO scanning** 1-2x daily, via your agent reading recent threads and calling `todo add`
 
-For manual full updates:
-```bash
-deep-context update [--dry-run]    # Extract all sources + enrich + re-synthesize
-```
+For a manual full update, run the `update-deep-context` skill (extract each source → enrich → `embed-update`).

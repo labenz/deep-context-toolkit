@@ -77,9 +77,9 @@ deep-context extract twitter-live     # Recent via the official X API
 deep-context enrich --limit 100 --source gmail
 deep-context enrich --limit 200 --from 2026-03-01    # threads active since a date
 ```
-Adds quality, authorship, originality, topics, sentiment, engagement, actionability, entities,
-and style tags to the owner's messages. Prefer `--from` over `--extracted-since` (the latter only
-sees brand-new threads). Without a key, `enrich` prints a note and exits 0.
+Adds `quality_score` (1-7), `authorship_score` (0-1), `originality_score` (1-7), `topics` and
+`entities` to the owner's messages. `extract-for-summary` uses quality/originality to drop filler
+and AI-written mail. Without a key, `enrich` prints a note and exits 0.
 
 ### Generate summaries from recent activity
 ```bash
@@ -115,27 +115,11 @@ Lifecycle: detected → pending → accepted/dismissed → completed (stale `inc
 
 ---
 
-## Synthesize / Export / Contacts
+## Initial history load (Slack)
 ```bash
-deep-context synthesize timeline --from 2025-01-01 --to 2025-12-31
-deep-context synthesize relationships --person jane-doe
-deep-context export people --output people.csv --format csv
-deep-context contacts status | suggest [--use-llm] | auto-accept --min-confidence 0.99
-deep-context contacts link <p1> <p2> | reject <p1> <p2> | search "Jane" | show <id>
+deep-context backfill slack mentions --from 2021-01-01        # checkpointed; rerun to resume
+deep-context backfill slack channel-full --channel C0123 --from 2024-01-01
 ```
-
-## Maintenance
-```bash
-deep-context patch-html-emails [--dry-run] [--limit N]
-deep-context patch-slack-mentions [--dry-run] [--limit N]
-deep-context migrate-twitter-threads [--dry-run]
-deep-context hydrate-twitter-stubs [--dry-run]
-deep-context dedup-beeper-imessage [--dry-run]
-```
-
----
-
-## Database Schema (Key Tables)
 
 | Table | Purpose |
 |-------|---------|
@@ -144,8 +128,6 @@ deep-context dedup-beeper-imessage [--dry-run]
 | `people` | People the owner interacts with, per-source identity |
 | `message_metadata` | AI enrichment for the owner's messages only |
 | `todo_items` | Detected action items |
-| `syntheses` | Generated summaries |
-| `unified_contacts` / `contact_links` | Deduplicated contacts and their links to `people` |
 | `extraction_log` | Extraction runs per source |
 
 **Thread ID format:** `source:thread_id` (e.g. `gmail:18d3a4b5c6d7e8f9`)

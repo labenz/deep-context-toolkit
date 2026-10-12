@@ -167,10 +167,7 @@ note and exits 0; report enrichment as "skipped (no key)" and move on.
 3. Run: `~/.bun/bin/bun tools/deep-context.ts enrich --limit <N> --from <lookback_date>`
    - `--from` filters on `threads.last_activity_at`, which updates whenever a thread gets new
      messages — so it catches both brand-new threads AND new replies in existing threads.
-   - **Don't use `--extracted-since`**: `threads.extracted_at` is set only on insert and never
-     bumped on update, so it sees only brand-new threads — which are usually inbound-only and
-     skipped by design (enrichment covers the owner's own messages). The typical result is
-     "All threads are already enriched!" with zero work done.
+   - (`--extracted-since` is a deprecated alias for `--from`; older scripts that pass it still work.)
 4. Sanity-check the backlog before/after so "0 enriched" is never ambiguous:
    ```sql
    SELECT COUNT(m.id) FROM threads t

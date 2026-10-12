@@ -775,7 +775,7 @@ async function extractGmail(opts: {
 }
 
 // ============================================================
-// EXPORTS (for use by deep-context.ts patch-html-emails)
+// EXPORTS (for use by deep-context.ts)
 // ============================================================
 
 export { convertHtmlToText, extractGmail }
