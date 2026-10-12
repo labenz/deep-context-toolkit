@@ -3890,14 +3890,23 @@ interface BeeperExclusionRule {
   reason?: string
 }
 
+// Documented location is data/deep_context/beeper-config.json (copied from beeper-config.template.json);
+// tools/beeper-config.json is still honored for older installs. Accepts both the template's
+// `excluded_contacts: [{ name }]` shape and the older `excludedContacts: [{ identifiers }]` shape.
 function loadBeeperConfig(): { excludedContacts: BeeperExclusionRule[] } {
-  const configPath = join(PROJECT_ROOT, 'tools/beeper-config.json')
-  try {
-    const raw = readFileSync(configPath, 'utf8')
-    return JSON.parse(raw)
-  } catch {
-    return { excludedContacts: [] }
+  for (const rel of ['data/deep_context/beeper-config.json', 'tools/beeper-config.json']) {
+    try {
+      const raw = JSON.parse(readFileSync(join(PROJECT_ROOT, rel), 'utf8'))
+      const rules = (raw.excludedContacts ?? raw.excluded_contacts ?? []) as Array<Record<string, any>>
+      const excludedContacts = rules
+        .map(r => ({ ...r, identifiers: Array.isArray(r.identifiers) ? r.identifiers : (r.name ? [r.name] : []) }))
+        .filter(r => r.identifiers.length > 0) as BeeperExclusionRule[]
+      return { excludedContacts }
+    } catch {
+      // missing or unreadable; try the next location
+    }
   }
+  return { excludedContacts: [] }
 }
 
 function matchesBeeperIdentifier(value: string | undefined | null, identifiers: string[]): boolean {

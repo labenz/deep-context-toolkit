@@ -59,14 +59,28 @@ interface BeeperConfig {
 const SCRIPT_DIR = path.dirname(Bun.main)
 
 function loadConfig(): BeeperConfig {
-  // Config file is in the same directory as this script
-  const configPath = path.join(SCRIPT_DIR, 'beeper-config.json')
-  try {
-    const raw = fs.readFileSync(configPath, 'utf8')
-    return JSON.parse(raw) as BeeperConfig
-  } catch {
-    return { excludedContacts: [], writeWhitelist: [] }
+  // Documented location is data/deep_context/beeper-config.json; tools/beeper-config.json (next to
+  // this script) is still honored for older installs. Accepts both the template's
+  // `excluded_contacts: [{ name }]` shape and the older `excludedContacts: [{ identifiers }]` shape.
+  const candidates = [
+    path.join(SCRIPT_DIR, '..', 'data', 'deep_context', 'beeper-config.json'),
+    path.join(SCRIPT_DIR, 'beeper-config.json'),
+  ]
+  for (const configPath of candidates) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(configPath, 'utf8'))
+      const rules = (raw.excludedContacts ?? raw.excluded_contacts ?? []) as Array<Record<string, any>>
+      return {
+        excludedContacts: rules
+          .map(r => ({ ...r, identifiers: Array.isArray(r.identifiers) ? r.identifiers : (r.name ? [r.name] : []) }))
+          .filter(r => r.identifiers.length > 0) as ExclusionRule[],
+        writeWhitelist: raw.writeWhitelist ?? [],
+      }
+    } catch {
+      // missing or unreadable; try the next location
+    }
   }
+  return { excludedContacts: [], writeWhitelist: [] }
 }
 
 const CONFIG = loadConfig()
