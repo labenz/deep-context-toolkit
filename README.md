@@ -10,6 +10,7 @@ On top of the raw knowledge base, an optional **wiki layer** turns the data into
 
 ## What's new (October 2026)
 
+- **No-OAuth start: Google Takeout import** — `deep-context import-takeout <takeout.zip>` loads your Gmail (mbox) and Google Calendar (.ics) export with no Google Cloud project, no OAuth client, no tokens. Streams multi-GB mailboxes, resumable, idempotent, and lines up row-for-row with the Gmail API extractor so you can switch to live extraction later without duplicates. See [Start without OAuth: Google Takeout](#start-without-oauth-google-takeout).
 - **Semantic + hybrid search** — `query --semantic` finds conversations by meaning, `--hybrid` merges keyword and semantic hits. Embeddings via Gemini (`gemini-embedding-2`) **or free and fully local via Ollama**; optional Voyage `rerank-3` pass for sharper top results. Stored in a separate sidecar DB; the main DB is never touched.
 - **Enrichment v2** — better default model (`gemini-3.7-flash`), indexed `[MSG n]` prompts that stop ID mix-ups, stricter entity grounding, retries on truncated output, windowing for huge threads, per-batch saves, and a clean skip when no Gemini key is configured.
 - **Agent-authorship tagging** — list the addresses your AI agents send from (`OWNER_CONFIG.agentEmails`) and their mail is tagged `authored_by=<agent>`, so "my own writing" stays yours.
@@ -53,7 +54,8 @@ The payoff is the combination: the wiki gives the agent broad, durable context a
 
 | Source | What it captures | Auth method |
 |--------|-----------------|-------------|
-| **Gmail** | Email you sent **plus inbound mail from known contacts** | Google OAuth (gmail.readonly) |
+| **Gmail** | Email you sent **plus inbound mail from known contacts** | Google OAuth (gmail.readonly) **or** a Google Takeout export (no OAuth) |
+| **Google Calendar** | Events (title, time, attendees, your RSVP, location, description) | Google Takeout export (no OAuth) |
 | **Slack** | Your messages, threads you're @-mentioned in, and full-capture channels — across workspaces, including DMs | Slack Bot Token per workspace |
 | **Beeper** | iMessage, WhatsApp, Signal conversations | Beeper Desktop API token |
 | **GroupMe** | Group and DM messages | GroupMe access token (no app) |
@@ -86,13 +88,57 @@ through setup interactively. Run init and a first Gmail extraction when
 we're done, and show me a few searches."
 ```
 
+No appetite for Google Cloud setup? Say instead: *"Help me import my Google Takeout export (see README → Start without OAuth)"*, and add OAuth later.
+
 6. Optional extras, in order of value: schedule refreshes (`tools/deep-context-cron.sh`), semantic search (`embed-backfill`), enrichment (`GEMINI_API_KEY`), the wiki layer ([WIKI.md](WIKI.md)).
+
+## Start without OAuth: Google Takeout
+
+Setting up Google OAuth (a Cloud project, a consent screen, a client ID) is the hardest part of getting started. You can skip it entirely: ask Google for an export of your mail and calendar, and import the file. Later you can add OAuth for daily incremental updates. The two paths use the same IDs, so nothing gets duplicated.
+
+### 1. Request the export (5 minutes, then wait)
+
+1. Go to **https://takeout.google.com** and sign in with the account you want to import.
+2. Click **Deselect all** at the top of the product list. You only want two products.
+3. Scroll to **Calendar** and tick it. Its format is iCalendar (`.ics`); leave that as is.
+4. Scroll to **Mail** and tick it. The format is **MBOX**, which is what we need. "All Mail data included" is fine. Spam and Trash come along, and the importer skips them.
+5. Click **Next step** at the bottom.
+6. Destination: **Send download link via email**. Frequency: **Export once**. File type: **.zip**. File size: choose the **largest size offered** (e.g. 50 GB) so your mailbox stays in one file.
+7. Click **Create export**.
+
+Google emails you when the export is ready ("Your Google data is ready to download"). That takes **a few hours for most people, sometimes a day or two** for very large mailboxes. Google's wording on these screens changes from time to time; the choices are the same. Work/school (Google Workspace) accounts: your administrator may have disabled Takeout.
+
+### 2. Download
+
+Open the email, click **Download your files**, and sign in again when asked. The links expire after about a week. You'll get one or more files named like `takeout-20261012T120000Z-001.zip`. There's no need to unzip them.
+
+### 3. Import
+
+```bash
+# Fast first pass: just the last 30 days (orientation in minutes)
+bun tools/deep-context.ts import-takeout ~/Downloads/takeout-*.zip --since 2026-09-12   # = 30 days ago
+
+# Then the full history (resumable: Ctrl-C any time, re-run the same command to continue)
+bun tools/deep-context.ts import-takeout ~/Downloads/takeout-*.zip
+```
+
+What gets imported follows the same policy as live Gmail extraction:
+- every thread you wrote in, excluding Promotions, Updates and Social;
+- inbound threads from people who appear in those threads;
+- calendar events, which you can search with `query <term> --source calendar`.
+
+Spam, Trash, Drafts and Chats are skipped. Attachments are flagged (`has_attachments`) but not stored. Addresses listed in `config.json` → `privacy.excluded_emails` are never imported.
+
+If you haven't filled in `OWNER_CONFIG.emails` yet, the importer works out your addresses from your Sent mail and tells you what to add. You can also pass `--me you@example.com`. A second Google account goes in with `--account work`, which stores it as `source='gmail-work'`, the same convention `extract gmail --account work` uses.
+
+The importer stages parsed mail in `data/deep_context/takeout/staging-<account>.db`. This file is what makes a re-run instant. Delete it once you're done. Full options: `bun tools/import-takeout.ts --help`.
 
 ### Keys: required vs optional
 
 | Capability | Needs | Without it |
 |---|---|---|
-| Gmail extraction | Google OAuth client (`GOOGLE_CLIENT_ID/SECRET`) | — |
+| Gmail extraction (live, incremental) | Google OAuth client (`GOOGLE_CLIENT_ID/SECRET`) | use a Google Takeout export (`import-takeout`) instead |
+| Gmail + Calendar history import | a Google Takeout `.zip` — nothing else | — |
 | Slack / Beeper / GroupMe / Fireflies / X live | that source's token | source is skipped |
 | Keyword search, `recent`, todos, exports, dropped-balls | nothing | — |
 | Scheduled refresh | a Claude Code or Codex subscription (CLI installed) | run `/update-deep-context` by hand |
@@ -104,7 +150,7 @@ we're done, and show me a few searches."
 ## Prerequisites
 
 - **Bun** (TypeScript runtime) -- `curl -fsSL https://bun.sh/install | bash`
-- **Google Cloud OAuth credentials** -- for Gmail access (gmail.readonly scope, device auth flow)
+- **Google Cloud OAuth credentials** -- for live Gmail access (gmail.readonly scope, device auth flow). *Optional if you start from a Google Takeout export.*
 - **Slack Bot Token(s)** -- one per workspace, with channels:history, channels:read, search:read, users:read scopes
 - **Beeper Desktop** (optional) -- with Developer API enabled for iMessage/WhatsApp/Signal
 - **GroupMe access token** (optional) -- create an app at dev.groupme.com; token-only, no desktop app
@@ -127,6 +173,7 @@ deep-context-toolkit/
     deep-context-cron.sh     # Scheduled refresh via your Claude Code / Codex subscription
     dropped-balls.ts         # Email threads awaiting your reply
     gmail-extractor.ts       # Gmail extraction logic (outbound + inbound-from-known passes)
+    import-takeout.ts        # Google Takeout importer (Gmail mbox + Calendar .ics), no OAuth
     slack.ts                 # Slack API client
     twitter-api.ts           # Twitter/X official API v2 client (live tweet fetch)
     beeper.ts                # Beeper Desktop API client
@@ -177,6 +224,7 @@ deep-context status                  # Show extraction status, counts, staleness
 
 # Extraction
 deep-context extract gmail           # Extract Gmail (outbound + inbound-from-known passes)
+deep-context import-takeout takeout.zip [--since DATE]   # Gmail + Calendar from Google Takeout, no OAuth
 deep-context extract slack           # Extract Slack (your msgs + mentions + full-capture channels)
 deep-context extract slack-dm        # Extract Slack DMs
 deep-context extract beeper          # Extract Beeper messages

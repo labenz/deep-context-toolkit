@@ -36,3 +36,6 @@ data/deep_context/*.db-wal
 data/deep_context/*.db.building
 data/deep_context/debug/
 logs/
+
+# Google Takeout import staging (parsed mail — private)
+data/deep_context/takeout/
