@@ -4373,8 +4373,15 @@ const GROUPME_API_BASE = 'https://api.groupme.com/v3'
 //   - EXCLUDE: never capture, skipped before any message fetch (saves API calls).
 //   - FORCE_INCLUDE: capture even if the owner hasn't posted (valuable read-only context).
 // DMs are always captured regardless of participation (see gate below).
-const GROUPME_EXCLUDE_GROUPS = new Set(['morning run'])          // basketball group — high noise, no recent participation
-const GROUPME_FORCE_INCLUDE_GROUPS = new Set(['u.d. neighbors']) // neighborhood info (contractor lists, etc.) worth keeping even when lurking
+// Configure in config.json: extraction.groupme.exclude_groups / force_include_groups (lowercase names).
+function groupmeGroupSet(key: 'exclude_groups' | 'force_include_groups'): Set<string> {
+  try {
+    const list = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))?.extraction?.groupme?.[key]
+    return new Set(Array.isArray(list) ? list.map((g: string) => String(g).toLowerCase()) : [])
+  } catch { return new Set() }
+}
+const GROUPME_EXCLUDE_GROUPS = groupmeGroupSet('exclude_groups')
+const GROUPME_FORCE_INCLUDE_GROUPS = groupmeGroupSet('force_include_groups')
 
 async function extractGroupMe(
   db: Database,
