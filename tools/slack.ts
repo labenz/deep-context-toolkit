@@ -1999,11 +1999,14 @@ async function cmd_send(a: Args) {
     die('Error: slack send: pass either --to or --channel, not both', ExitCode.BAD_USAGE)
   }
 
-  // Send requires bot token (user token lacks chat:write); force it.
+  // Send needs chat:write. Prefer a bot token; fall back to a user token
+  // (an xoxp user token with chat:write posts AS the user — the correct
+  // identity for your own DMs/MPDMs, e.g. in a workspace where you can't install a bot).
   await load_env()
   const bot_key = a.workspace ? `SLACK_BOT_TOKEN_${a.workspace}` : 'SLACK_BOT_TOKEN'
-  const token = env_get(bot_key)
-  if (!token) die(`Error: Missing ${bot_key} (bot token required for chat:write)`, ExitCode.BAD_USAGE)
+  const user_key = a.workspace ? `SLACK_USER_TOKEN_${a.workspace}` : 'SLACK_USER_TOKEN'
+  const token = env_get(bot_key) || env_get(user_key)
+  if (!token) die(`Error: Missing ${bot_key} or ${user_key} (need a token with chat:write)`, ExitCode.BAD_USAGE)
 
   let channel_id: string | null = null
   let target_label = ''

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd job: refresh deep-context 3x daily (07:00, 13:00, 19:00) using your
+  Claude Code or Codex subscription. Install:
+
+    1. Replace /ABSOLUTE/PATH/TO/deep-context-toolkit below (all three places) with your clone path.
+    2. cp templates/com.deep-context.update.plist ~/Library/LaunchAgents/
+    3. launchctl load ~/Library/LaunchAgents/com.deep-context.update.plist
+    4. Test now: launchctl start com.deep-context.update ; tail -f logs/deep-context-cron.log
+
+  The "- -todo" argument (second ProgramArguments entry) adds a TODO scan to each run;
+  delete that line if you don't want one. Jobs only run while the Mac is awake.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.deep-context.update</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/deep-context-toolkit/tools/deep-context-cron.sh</string>
+    <string>--todo</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Hour</key><integer>19</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
+  <key>StandardOutPath</key>
+  <string>/ABSOLUTE/PATH/TO/deep-context-toolkit/logs/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/ABSOLUTE/PATH/TO/deep-context-toolkit/logs/launchd.log</string>
+</dict>
+</plist>

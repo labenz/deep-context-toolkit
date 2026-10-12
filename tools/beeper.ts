@@ -544,8 +544,11 @@ async function cmd_messages(a: Args) {
 
   const params = new URLSearchParams()
   if (a.limit) params.set('limit', String(a.limit))
-  if (a.before) params.set('before', a.before)
-  if (a.after) params.set('after', a.after)
+  // Numeric --before/--after = a message sortKey → Beeper's cursor pagination (date filters are ignored by the API)
+  if (a.before && /^\d+$/.test(a.before)) { params.set('cursor', a.before); params.set('direction', 'before') }
+  else if (a.before) params.set('before', a.before)
+  if (a.after && /^\d+$/.test(a.after)) { params.set('cursor', a.after); params.set('direction', 'after') }
+  else if (a.after) params.set('after', a.after)
 
   const url = `/v1/chats/${encodedChatId}/messages${params.toString() ? `?${params}` : ''}`
   const response = await beeperApi<{ items?: Message[] } | Message[]>(url, { token })

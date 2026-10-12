@@ -51,7 +51,13 @@ CREATE TABLE IF NOT EXISTS messages (
 
     -- Who sent it
     sender_id TEXT REFERENCES people(id),
-    is_from_me BOOLEAN NOT NULL,  -- Quick filter for the owner's messages
+    is_from_me BOOLEAN NOT NULL,  -- Sent from one of the owner's own accounts
+
+    -- Who actually composed the words. is_from_me answers "whose account",
+    -- authored_by answers "whose voice" -- an AI agent sending from the owner's
+    -- account is is_from_me=1, authored_by='<agent-id>'. NULL = not judged.
+    authored_by TEXT,
+    authorship_evidence TEXT,  -- how we know; free text
 
     -- Content
     content TEXT NOT NULL,

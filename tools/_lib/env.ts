@@ -57,7 +57,10 @@ export function resolve_project_root(): string {
   const startDir = process.cwd()
   const detected = ascendToMarker(startDir)
   if (detected) return detected
-  if (startDir && startDir.trim()) return resolve(startDir)
+  const resolvedStart = startDir && startDir.trim() ? resolve(startDir) : ''
+  // A bare filesystem root (cron/agent sessions sometimes run with cwd "/") is
+  // never a real project — writes like PROJECT_ROOT/context/... would land in /.
+  if (resolvedStart && resolvedStart !== parse(resolvedStart).root) return resolvedStart
   return DISTRIBUTION_ROOT
 }
 

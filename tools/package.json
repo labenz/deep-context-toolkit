@@ -4,6 +4,7 @@
     "csv-stringify": "^6.6.0",
     "email-reply-parser": "^2.3.5",
     "html-to-text": "^9.0.5",
-    "js-yaml": "^4.1.1"
+    "js-yaml": "^4.1.1",
+    "sqlite-vec": "^0.1.9"
   }
 }

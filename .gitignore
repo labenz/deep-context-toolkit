@@ -28,3 +28,11 @@ tools/node_modules/
 .DS_Store
 *.swp
 *~
+
+# Semantic-search sidecars, public export, debug artifacts
+data/deep_context/*.db
+data/deep_context/*.db-shm
+data/deep_context/*.db-wal
+data/deep_context/*.db.building
+data/deep_context/debug/
+logs/

@@ -3,7 +3,7 @@
 // Deep Context CLI - Personal knowledge base management
 // Extracts communications, enriches with metadata, generates syntheses
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, copyFileSync, statSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, copyFileSync, statSync, renameSync, unlinkSync } from 'fs'
 import { parse_flags, print_help, type ParsedArgs, type FlagSchema } from './_lib/cli'
 import { dirname, join } from 'path'
 import Database from 'bun:sqlite'
@@ -24,7 +24,23 @@ import {
 } from './_lib/contact-matching'
 import { evaluateWithLLM, batchEvaluateWithLLM, type LLMMatchResult } from './_lib/contact-llm'
 import EmailReplyParser from 'email-reply-parser'
-import { convertHtmlToText, extractGmail as extractGmailRaw } from './gmail-extractor'
+import { convertHtmlToText, extractGmail as extractGmailRaw, GMAIL_SOURCE } from './gmail-extractor'
+import {
+  openVectorDb,
+  chunkThread,
+  embedTexts,
+  embedQuery,
+  vecToBlob,
+  estimateTokens as estimateEmbedTokens,
+  embedConfig,
+  vectorDbFileName,
+  getEmbedApiKey,
+  DEFAULT_BATCH_SIZE,
+  fetchVoyageKey,
+  rerank,
+  RERANK_POOL,
+  type Chunk
+} from './deep-context-semantic'
 
 
 // ══════════════════════════════════════════════════════════════
@@ -37,6 +53,11 @@ export const OWNER_CONFIG = {
   twitterHandle: '',                     // e.g., 'janedoe' (without @) — leave empty to skip Twitter
   twitterId: '',                         // Numeric Twitter ID — leave empty to skip
   phone: '',                             // Phone number for contact matching — leave empty to skip
+  // Addresses your AI agents send email FROM (e.g. an assistant Gmail account) → the person ID
+  // to file those messages under. Their messages get authored_by=<id>, so "my own writing"
+  // queries and voice-matching can exclude agent-written text. Leave empty if none.
+  // e.g. { 'assistant@example.com': 'my-assistant' }
+  agentEmails: {} as Record<string, string>,
   slackIdentifiers: {
     // Per-workspace Slack info. Add one entry per workspace (key = workspace flag).
     // 'workspace_flag': { userId: 'UXXXXXXXX', searchQuery: 'from:@yourname', mentionQueries: ['@yourname'] }
@@ -64,12 +85,38 @@ USAGE:
   deep-context synthesize <type> [--person ID] [--project ID] [--force]
     Types: timeline, relationships, projects, preferences, thinking
 
-  # Search the database
+  # Search the database (keyword LIKE search by default — no API key needed)
   deep-context query <search_term> [--source SOURCE] [--from DATE] [--to DATE] [--limit N]
+    --semantic   Vector search over embedded conversation chunks (meaning, not keywords)
+    --hybrid     Combine keyword + semantic results (reranked together; RRF by thread if rerank off)
+    --no-rerank  Skip the optional Voyage rerank-3 pass (used automatically for --semantic/--hybrid
+                 when VOYAGE_API_KEY is set; also off via DEEP_CONTEXT_RERANK=0).
+    Semantic search requires a vector index — build with embed-backfill first.
+    Embedding provider: Gemini (GEMINI_API_KEY) by default, or local Ollama with
+    DEEP_CONTEXT_EMBED_PROVIDER=ollama (free, private; ollama pull nomic-embed-text).
+
+  # Build / maintain the semantic vector index (sidecar DB: deep_context_vectors_<provider>.db)
+  deep-context embed-backfill [--source S] [--from DATE] [--to DATE] [--limit N] [--dry-run]
+                              [--batch-size N] [--max-cost DOLLARS]
+    Embeds thread-chunks (consecutive messages, <=~5.5K chars) into a sqlite-vec index.
+    Resumable: safe to interrupt and rerun (tracks per-thread state + chunk content
+    hashes; skips what's already embedded). Purely additive — never writes to
+    deep_context.db (opens it read-only). --limit caps chunks embedded this run;
+    --max-cost stops at an estimated spend. --dry-run reports chunk count + cost.
+  deep-context embed-update            Alias for embed-backfill (embeds anything new)
+  deep-context embed-status            Show vector index coverage and estimated spend
 
   # Export data or syntheses
   deep-context export <type> --output FILE [--format FORMAT]
     Types: messages, people, syntheses
+
+  # Build a public-only DB (default: podcast + your own tweets) with an FTS5 index
+  deep-context export-public [--output FILE] [--push USER@HOST:DIR]
+    Builds a slim, queryable SQLite file containing ONLY public sources plus a
+    full-text index — safe to hand to low-access agents (e.g. on another machine)
+    that should never see your private mail/chats. Sources come from
+    config.json "public_sources" (default ["podcast", "twitter"]). --push scp's the
+    file to a remote directory. Default output: data/deep_context/public_deep_context.db
 
   # Extract content for LLM summarization (thread-centric view)
   deep-context extract-for-summary --from DATE --to DATE [--output FILE] [--token-budget N]
@@ -159,6 +206,13 @@ EXAMPLES:
   # Search for messages mentioning "project-name"
   deep-context query "project-name" --source gmail
 
+  # Semantic search (finds paraphrases keyword search misses)
+  deep-context query "frustrated with the vendor's turnaround time" --semantic
+  deep-context query "planning the kids' summer activities" --hybrid --limit 10
+
+  # Build the vector index for recent mail, capped at $0.50
+  deep-context embed-backfill --from 2026-05-01 --max-cost 0.50
+
   # Export all people to JSON
   deep-context export people --output people.json
 `
@@ -167,6 +221,12 @@ EXAMPLES:
 const PROJECT_ROOT = dirname(import.meta.dir)
 const DATA_DIR = join(PROJECT_ROOT, 'data/deep_context')
 const DB_PATH = join(DATA_DIR, 'deep_context.db')
+// Semantic-search sidecar. One file per embedding provider — vector spaces from different
+// models are incompatible. Override with DEEP_CONTEXT_VECTOR_DB.
+// Resolved lazily so DEEP_CONTEXT_* settings in tools/.env (applied in main()) take effect.
+function vectorDbPath(): string {
+  return process.env.DEEP_CONTEXT_VECTOR_DB || join(DATA_DIR, vectorDbFileName())
+}
 const SCHEMA_PATH = join(DATA_DIR, 'schema.sql')
 const CONFIG_PATH = join(DATA_DIR, 'config.json')
 
@@ -249,6 +309,18 @@ function getDb(): Database {
       );
     `)
     console.log('Created extraction_watermarks table')
+  }
+
+  // Migrate: authorship columns on messages (additive). is_from_me answers "whose
+  // account sent it"; authored_by answers "whose words" — an AI agent sending from your
+  // account is is_from_me=1, authored_by='<agent>'. NULL = not judged.
+  const msgCols = new Set((db.query(`PRAGMA table_info(messages)`).all() as Array<{ name: string }>).map(c => c.name))
+  if (msgCols.size > 0 && !msgCols.has('authored_by')) {
+    db.exec(`ALTER TABLE messages ADD COLUMN authored_by TEXT`)
+    console.log('Added messages.authored_by column')
+  }
+  if (msgCols.size > 0 && !msgCols.has('authorship_evidence')) {
+    db.exec(`ALTER TABLE messages ADD COLUMN authorship_evidence TEXT`)
   }
 
   return db
@@ -814,16 +886,24 @@ async function extractGmail(
   _db: Database,
   opts: { fromDate?: string; toDate?: string; limit?: number; dryRun: boolean }
 ): Promise<ExtractionResult> {
+  // Each mailbox carries its own source value ('gmail', 'gmail-travel', …), so
+  // the auto-detected start date must be scoped to the one we're reading —
+  // otherwise a busy stretch in the primary account would advance the travel
+  // account's window past mail it never fetched.
+  if (GMAIL_SOURCE !== 'gmail') console.log(`  Gmail: reading peer account → source '${GMAIL_SOURCE}'`)
+
   let fromDate = opts.fromDate
   if (!fromDate) {
     const newest = _db.query(`
-      SELECT MAX(last_activity_at) as newest FROM threads WHERE source = 'gmail'
-    `).get() as { newest: string | null } | null
+      SELECT MAX(last_activity_at) as newest FROM threads WHERE source = ?
+    `).get(GMAIL_SOURCE) as { newest: string | null } | null
     if (newest?.newest) {
       const d = new Date(newest.newest)
       d.setDate(d.getDate() - 7)
       fromDate = d.toISOString().split('T')[0]
-      console.log(`  Gmail: auto-detected --from ${fromDate} (7 days before newest thread)`)
+      console.log(`  Gmail: auto-detected --from ${fromDate} (7 days before newest ${GMAIL_SOURCE} thread)`)
+    } else if (GMAIL_SOURCE !== 'gmail') {
+      console.log(`  Gmail: no prior ${GMAIL_SOURCE} threads — pass --from to bound the first run`)
     }
   }
 
@@ -873,7 +953,10 @@ async function extractTwitter(
   }
 
   if (!existsSync(archivePath)) {
-    console.error(`Error: Twitter archive not found at: ${archivePath}`)
+    // Archives are one-shot imports: once absorbed into the DB they're usually
+    // deleted from Downloads. Not an error — the live API pass covers ongoing
+    // tweets. Only matters if you've just downloaded a fresh archive.
+    console.log(`  Skipping archive pass (not present at ${archivePath}) — live API pass covers recent tweets`)
     return { count: 0, newest: null, oldest: null }
   }
 
@@ -5029,6 +5112,22 @@ async function extractPodcast(
       ).get(threadId)
       const hasSponsoredEpisode = (episode.sponsors || '').trim().length > 0
 
+      // Editorial commentary is written AFTER the interview, so commentary_file is
+      // routinely populated only after the episode was first extracted. The skip
+      // condition used to consider speaker turns + ad reads only, and the commentary
+      // import below was hard-skipped in backfill mode — so a commentary file added
+      // later could never be picked up by any run. That is why editorial_commentary
+      // had stalled at 2026-06-10 while every other podcast content type stayed current.
+      const hasCommentary = db.query(
+        `SELECT 1 FROM messages WHERE thread_id = ? AND content_type = 'editorial_commentary' LIMIT 1`
+      ).get(threadId)
+      let commentaryPending = false
+      if (!hasCommentary && episode.commentary_file) {
+        try {
+          commentaryPending = existsSync(join(podcastDir, episode.commentary_file))
+        } catch { /* ignore stat errors */ }
+      }
+
       // Detect transcript expansion: if the on-disk file is much larger than what's
       // already in the DB, the transcript was probably expanded (e.g., a stub was
       // backfilled with a real transcription) and we should re-import speaker turns.
@@ -5048,7 +5147,7 @@ async function extractPodcast(
         }
       }
 
-      if (hasSpeakerTurns && (hasAdReads || !hasSponsoredEpisode) && !transcriptExpanded) {
+      if (hasSpeakerTurns && (hasAdReads || !hasSponsoredEpisode) && !transcriptExpanded && !commentaryPending) {
         skipped++
         continue
       }
@@ -5149,7 +5248,7 @@ async function extractPodcast(
         }
       }
     }
-    } // end !backfillMode
+    } // end commentary block
 
     // 2. Import Transcript Speaker Turns (the interview itself)
     const transcriptFile = episode.transcript_file
@@ -5197,8 +5296,10 @@ async function extractPodcast(
       }
     }
 
-    // 3. Import Editorial Commentary (written after interview) — skip in backfill mode
-    if (!backfillMode) {
+    // 3. Import Editorial Commentary (written after the interview).
+    //    Runs in backfill mode too — backfill drops ids that already exist and inserts
+    //    with OR IGNORE, so a re-run cannot duplicate the single commentary message.
+    {
     const commentaryFile = episode.commentary_file
     if (commentaryFile) {
       const commentaryPath = join(podcastDir, commentaryFile)
@@ -5330,17 +5431,22 @@ async function extractPodcast(
 
     if (!opts.dryRun) {
       if (backfillMode) {
-        // Backfill: only insert new speaker_turn and ad_read messages and update thread counts.
+        // Backfill the content types that can legitimately arrive AFTER a thread was
+        // first extracted: speaker turns / ad reads (re-transcription, ad extraction) and
+        // editorial_commentary / questions (files written post-interview). Restricting
+        // this to speaker_turn + ad_read is what stranded editorial_commentary at
+        // 2026-06-10 — commentary_file gets populated later, and no run would look again.
         // Pre-filter against existing message IDs so we don't double-count when re-running
         // backfill on threads that already have some of these messages.
-        const candidateInserts = messageInserts.filter(m => m.contentType === 'speaker_turn' || m.contentType === 'ad_read')
+        const BACKFILLABLE = new Set(['speaker_turn', 'ad_read', 'editorial_commentary', 'questions'])
+        const candidateInserts = messageInserts.filter(m => BACKFILLABLE.has(m.contentType))
         if (candidateInserts.length === 0) {
           skipped++
           continue
         }
         const existingIds = new Set<string>()
         for (const row of db.query(
-          `SELECT id FROM messages WHERE thread_id = ? AND content_type IN ('speaker_turn','ad_read')`
+          `SELECT id FROM messages WHERE thread_id = ? AND content_type IN ('speaker_turn','ad_read','editorial_commentary','questions')`
         ).all(threadId) as Array<{ id: string }>) {
           existingIds.add(row.id)
         }
@@ -5795,6 +5901,22 @@ async function cmdEnrich(args: ParsedArgs): Promise<void> {
   const dryRun = args.flags['dry-run']
   const debug = args.flags.debug
 
+  // Enrichment is optional: everything else (extract, keyword query, todo, export)
+  // works without it. Skip cleanly instead of failing every batch when no key is set.
+  if (!dryRun) {
+    const env = await load_env()
+    if (!(env.GEMINI_API_KEY || process.env.GEMINI_API_KEY)) {
+      console.log('Enrichment skipped: no GEMINI_API_KEY in tools/.env (enrichment is optional).')
+      console.log('Add one from https://aistudio.google.com/apikey to enable quality/topic/sentiment metadata.')
+      return
+    }
+  }
+  if (extractedSince) {
+    console.warn('Note: --extracted-since only sees brand-new threads (threads.extracted_at is set on insert,')
+    console.warn('never on update), and new threads are usually inbound-only. Prefer --from <date>, which')
+    console.warn("filters on last_activity_at and so catches new replies in existing threads too.")
+  }
+
   const db = getDb()
 
   // First, get list of already-enriched message IDs for efficient filtering
@@ -6012,16 +6134,28 @@ async function enrichThread(
     ORDER BY m.position_in_thread ASC, m.timestamp ASC
   `).all(threadId) as typeof allMessages
 
-  // Find the owner's messages that need enrichment
-  const ownerMessages = allMessages.filter(m => m.is_from_me === 1)
+  // Find the owner's messages that need enrichment. Skip rows already enriched by the
+  // current model — without this every run restarted the thread at batch 1, so an
+  // interrupted pass over a big thread re-did the same early batches forever.
+  // Rows from older models are still redone.
+  const currentModelIds = new Set(
+    (db.query(`
+      SELECT mm.message_id FROM message_metadata mm
+      JOIN messages m ON m.id = mm.message_id
+      WHERE m.thread_id = ? AND mm.processor_model = ?
+    `).all(threadId, enrichModel()) as { message_id: string }[]).map(r => r.message_id)
+  )
+  const ownerMessages = allMessages.filter(m => m.is_from_me === 1 && !currentModelIds.has(m.id))
   const unenrichedIds = ownerMessages.map(m => m.id)
 
   if (unenrichedIds.length === 0) {
     return { messagesEnriched: 0, promptTokens: 0, outputTokens: 0 }
   }
 
-  // Build the prompt with full thread context
-  const threadContext = allMessages.map(m => {
+  // Build the prompt with full thread context. Only the current batch's messages get
+  // [MSG n] markers (short indexes — long IDs were frequently mis-transcribed by models);
+  // everything else is context.
+  const renderMessage = (m: typeof allMessages[number], batchIndex: Map<string, number>) => {
     let sender: string
     if (m.is_from_me) {
       sender = OWNER_CONFIG.displayName.split(' ')[0]
@@ -6036,9 +6170,48 @@ async function enrichThread(
     } else {
       sender = 'Other'
     }
-    const prefix = m.is_from_me ? `[MESSAGE_ID: ${m.id}]\n` : ''
+    const prefix = batchIndex.has(m.id) ? `[MSG ${batchIndex.get(m.id)}]\n` : ''
     return `${prefix}${sender} (${m.timestamp.split('T')[0]}):\n${m.content}`
-  }).join('\n\n---\n\n')
+  }
+
+  // Very large threads (25K+ messages) blew past Gemini's 1,048,576-token input cap when
+  // the whole thread was sent as context for every batch — every batch 400'd, so the thread
+  // never enriched and permanently blocked the head of the enrichment queue. Above a char
+  // budget we send a window centred on the batch instead: the batch's own messages always,
+  // plus as much surrounding conversation as fits. Below the budget, behaviour is unchanged.
+  const CONTEXT_CHAR_BUDGET = 400_000 // ~100K tokens: hundreds of surrounding messages, far under the 1M cap
+  const msgChars = (m: typeof allMessages[number]) => (m.content?.length ?? 0) + 60
+  const totalContextChars = allMessages.reduce((n, m) => n + msgChars(m), 0)
+
+  const buildContext = (batchIndex: Map<string, number>) => {
+    let window = allMessages
+    if (totalContextChars > CONTEXT_CHAR_BUDGET) {
+      const batchPositions = allMessages.reduce<number[]>((acc, m, i) => {
+        if (batchIndex.has(m.id)) acc.push(i)
+        return acc
+      }, [])
+      let lo = batchPositions.length > 0 ? batchPositions[0] : 0
+      let hi = batchPositions.length > 0 ? batchPositions[batchPositions.length - 1] : 0
+      let used = allMessages.slice(lo, hi + 1).reduce((n, m) => n + msgChars(m), 0)
+      while (used < CONTEXT_CHAR_BUDGET && (lo > 0 || hi < allMessages.length - 1)) {
+        if (lo > 0) {
+          const next = msgChars(allMessages[lo - 1])
+          if (used + next > CONTEXT_CHAR_BUDGET) break
+          used += next
+          lo--
+        }
+        if (hi < allMessages.length - 1) {
+          const next = msgChars(allMessages[hi + 1])
+          if (used + next > CONTEXT_CHAR_BUDGET) break
+          used += next
+          hi++
+        }
+      }
+      window = allMessages.slice(lo, hi + 1)
+      console.log(`      Context windowed: ${window.length}/${allMessages.length} messages (thread exceeds token budget)`)
+    }
+    return window.map(m => renderMessage(m, batchIndex)).join('\n\n---\n\n')
+  }
 
   // Batch size: consolidated schema (~100 tokens/msg output) allows large batches
   // Gemini 3 Flash supports large outputs, 100 messages should fit easily
@@ -6055,6 +6228,7 @@ async function enrichThread(
 
   let totalPromptTokens = 0
   let totalOutputTokens = 0
+  let enriched = 0
   const allResponses: Array<{
     thread_analysis: any
     messages: any[]
@@ -6066,6 +6240,8 @@ async function enrichThread(
       console.log(`    Batch ${batchIdx + 1}/${batches.length} (${batchIds.length} messages)`)
     }
 
+    const batchIndex = new Map(batchIds.map((id, i) => [id, i + 1]))
+    const threadContext = buildContext(batchIndex)
     const schema = buildThreadEnrichmentSchema(batchIds)
     const prompt = buildEnrichmentPrompt(thread, threadContext, batchIds, participantNames)
 
@@ -6078,58 +6254,97 @@ async function enrichThread(
 
     // Call Gemini with structured output
     const geminiPath = join(PROJECT_ROOT, 'tools/gemini.ts')
-    const schemaPath = join(DATA_DIR, 'debug', '_temp_schema.json')
+    // Per-process + per-batch path: a fixed shared filename meant two concurrent
+    // enrich runs (e.g. the 3x-daily cron overlapping a manual backlog pass) would
+    // overwrite each other's schema mid-flight and silently mis-enrich.
+    const schemaPath = join(DATA_DIR, 'debug', `_temp_schema.${process.pid}.${batchIdx}.json`)
     await Bun.write(schemaPath, JSON.stringify(schema))
 
-    const proc = Bun.spawn({
-      cmd: [process.execPath, geminiPath, '-m', 'gemini-3-flash-preview', '--schema', schemaPath, '--max-tokens', '131072', '-t', '0.3', '--no-stream'],
-      stdin: new Blob([prompt]),
-      stdout: 'pipe',
-      stderr: 'pipe',
-    })
+    // Retry loop: Gemini Flash models intermittently truncate structured output
+    // mid-object (a hard cut well under --max-tokens, not a natural stop); the identical
+    // prompt succeeds on retry. Without this a single bad batch threw and discarded the
+    // whole thread's work, so scheduled runs reported "0 enriched" while still exiting 0.
+    const MAX_ATTEMPTS = 3
+    let batchResponse: any = null
+    let lastErr = ''
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const proc = Bun.spawn({
+        cmd: [process.execPath, geminiPath, '-m', enrichModel(), '--schema', schemaPath, '--max-tokens', '65536', '-t', '0.3', '--no-stream'],
+        stdin: new Blob([prompt]),
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
 
-    const stdout = await new Response(proc.stdout).text()
-    const stderr = await new Response(proc.stderr).text()
-    const exitCode = await proc.exited
+      const stdout = await new Response(proc.stdout).text()
+      const stderr = await new Response(proc.stderr).text()
+      const exitCode = await proc.exited
 
-    if (exitCode !== 0) {
-      throw new Error(`Gemini error (batch ${batchIdx + 1}): ${stderr}`)
+      if (exitCode !== 0) {
+        lastErr = `Gemini error (batch ${batchIdx + 1}): ${stderr}`
+        if (attempt < MAX_ATTEMPTS) {
+          console.log(`      Attempt ${attempt}/${MAX_ATTEMPTS} failed (exit ${exitCode}), retrying...`)
+          continue
+        }
+        try { unlinkSync(schemaPath) } catch { /* already gone — fine */ }
+        throw new Error(lastErr)
+      }
+
+      if (opts.debug) {
+        const debugDir = join(DATA_DIR, 'debug')
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+        await Bun.write(join(debugDir, `enrich_${timestamp}_response.txt`), stdout)
+      }
+
+      // Parse JSON response
+      const jsonStart = stdout.indexOf('{')
+      const jsonEnd = stdout.lastIndexOf('}')
+      try {
+        if (jsonStart === -1 || jsonEnd === -1) throw new Error('No JSON found in response')
+        batchResponse = JSON.parse(stdout.slice(jsonStart, jsonEnd + 1))
+      } catch (e) {
+        batchResponse = null
+        lastErr = `Batch ${batchIdx + 1} parse failure: ${e instanceof Error ? e.message : String(e)}`
+        if (attempt < MAX_ATTEMPTS) {
+          console.log(`      Attempt ${attempt}/${MAX_ATTEMPTS} returned truncated/invalid JSON, retrying...`)
+          continue
+        }
+        try { unlinkSync(schemaPath) } catch { /* already gone — fine */ }
+        throw new Error(lastErr)
+      }
+
+      // v2 schema returns msg_index (1-based within this batch); map back to the real ID.
+      for (const mm of batchResponse.messages ?? []) {
+        const idx = Number(mm.msg_index)
+        mm.message_id = batchIds[idx - 1] ?? `bad-index:${mm.msg_index}`
+      }
+
+      // Only count tokens for the attempt whose output we actually keep.
+      const tokenMatch = stderr.match(/Tokens:\s*(\d+)\s*in,\s*(\d+)\s*out/)
+      if (tokenMatch) {
+        totalPromptTokens += parseInt(tokenMatch[1], 10)
+        totalOutputTokens += parseInt(tokenMatch[2], 10)
+      }
+      break
     }
 
-    // Parse token counts from stderr
-    const tokenMatch = stderr.match(/Tokens:\s*(\d+)\s*in,\s*(\d+)\s*out/)
-    if (tokenMatch) {
-      totalPromptTokens += parseInt(tokenMatch[1], 10)
-      totalOutputTokens += parseInt(tokenMatch[2], 10)
-    }
+    // Unique-per-batch schema files would otherwise pile up in debug/.
+    try { unlinkSync(schemaPath) } catch { /* already gone — fine */ }
 
-    if (opts.debug) {
-      const debugDir = join(DATA_DIR, 'debug')
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
-      await Bun.write(join(debugDir, `enrich_${timestamp}_response.txt`), stdout)
-    }
-
-    // Parse JSON response
-    const jsonStart = stdout.indexOf('{')
-    const jsonEnd = stdout.lastIndexOf('}')
-    if (jsonStart === -1 || jsonEnd === -1) {
-      throw new Error(`No JSON found in response (batch ${batchIdx + 1})`)
-    }
-
-    const batchResponse = JSON.parse(stdout.slice(jsonStart, jsonEnd + 1))
     allResponses.push(batchResponse)
+
+    // Write this batch's rows now. A 66-batch thread used to hold everything in memory
+    // and write once at the end — an OOM kill at batch 39 (2026-09-10) lost all of it.
+    enriched += storeBatch(batchResponse, allResponses[0]?.thread_analysis || {})
   }
 
   // Use token counts from batches
   const promptTokens = totalPromptTokens
   const outputTokens = totalOutputTokens
-
-  // Store metadata for each message from all batches
   const threadAnalysis = allResponses[0]?.thread_analysis || {}
-  let enriched = 0
 
-  for (const response of allResponses) {
-    for (const msgMeta of response.messages) {
+  function storeBatch(response: { messages: any[] }, threadAnalysis: any): number {
+    let n = 0
+    for (const msgMeta of response.messages ?? []) {
     if (!unenrichedIds.includes(msgMeta.message_id)) {
       console.warn(`  Warning: Unexpected message_id ${msgMeta.message_id}`)
       continue
@@ -6144,7 +6359,7 @@ async function enrichThread(
         entities, style_tags, thread_role, relationship_dynamic,
         processed_at, processor_model
       ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), 'gemini-3-flash'
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?
       )
     `).run(
       msgMeta.message_id,
@@ -6159,11 +6374,13 @@ async function enrichThread(
       msgMeta.entities ? JSON.stringify(msgMeta.entities) : null,
       msgMeta.style_tags ? JSON.stringify(msgMeta.style_tags) : null,
       msgMeta.thread_role ?? null,
-      threadAnalysis.relationship_dynamic ?? null
+      threadAnalysis.relationship_dynamic ?? null,
+      enrichModel()
     )
 
-    enriched++
+    n++
     }
+    return n
   }
 
   // Update thread with enrichment analysis
@@ -6185,15 +6402,40 @@ async function enrichThread(
   return { messagesEnriched: enriched, promptTokens, outputTokens }
 }
 
+// Enrichment model + prompt/schema v2 (2026-09). The default was chosen by a two-round
+// blind bake-off of several fast models on entity grounding, calibration and coverage.
+// v2 changes vs v1: [MSG n] indexes instead of raw IDs, explicit entity-grounding rule,
+// integer 1-7 scores with a "use the full range" instruction, topic-tag consistency.
+// Override with DEEP_CONTEXT_ENRICH_MODEL or config.json "enrichment.model" (any Gemini model
+// id tools/gemini.ts accepts). Rows carry the model in message_metadata.processor_model, so
+// switching models makes previously-enriched messages eligible again.
+const DEFAULT_ENRICH_MODEL = 'gemini-3.7-flash'
+function enrichModel(): string {
+  return ENRICH_MODEL_RESOLVED ??= resolveEnrichModel()
+}
+let ENRICH_MODEL_RESOLVED: string | undefined
+function resolveEnrichModel(): string {
+  if (process.env.DEEP_CONTEXT_ENRICH_MODEL) return process.env.DEEP_CONTEXT_ENRICH_MODEL
+  try {
+    if (existsSync(CONFIG_PATH)) {
+      const m = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))?.enrichment?.model
+      // 'gemini-3-flash' was the original template placeholder (never a callable id) — ignore it.
+      if (typeof m === 'string' && m && m !== 'gemini-3-flash') return m
+    }
+  } catch { /* fall through */ }
+  return DEFAULT_ENRICH_MODEL
+}
+
 // Consolidated schema: ~10 fields instead of ~35
 // Uses scores (0-1 or 1-7) instead of booleans for richer data
-function buildThreadEnrichmentSchema(messageIds: string[]): object {
+function buildThreadEnrichmentSchema(_messageIds: string[]): object {
   return {
     type: "object",
     required: ["thread_analysis", "messages"],
     properties: {
       thread_analysis: {
         type: "object",
+        required: ["thread_topic", "thread_type", "relationship_dynamic"],
         properties: {
           thread_topic: { type: "string", description: "Main topic of the thread" },
           thread_type: {
@@ -6208,59 +6450,23 @@ function buildThreadEnrichmentSchema(messageIds: string[]): object {
       },
       messages: {
         type: "array",
-        description: "Metadata for each of the owner's messages",
+        description: "One entry per [MSG n] marker, in order",
         items: {
           type: "object",
-          required: ["message_id", "quality_score", "authorship_score", "originality_score", "topics", "domain", "sentiment", "engagement", "actionability", "entities", "style_tags", "thread_role"],
+          required: ["msg_index", "quality_score", "authorship_score", "originality_score", "topics", "domain", "sentiment", "engagement", "actionability", "entities", "style_tags", "thread_role"],
           properties: {
-            message_id: {
-              type: "string",
-              description: "The message ID from [MESSAGE_ID: xxx] markers"
-            },
-            quality_score: {
-              type: "number", minimum: 1, maximum: 7,
-              description: "Overall quality 1-7: voice, insight, craft. 1=filler, 4=solid, 7=exceptional"
-            },
-            authorship_score: {
-              type: "number", minimum: 0, maximum: 1,
-              description: "Confidence 0-1 that the owner wrote this (vs quoted/LLM/forwarded)"
-            },
-            originality_score: {
-              type: "number", minimum: 1, maximum: 7,
-              description: "Intellectual originality 1-7: 1=common wisdom, 4=thoughtful, 7=unique insight"
-            },
-            topics: {
-              type: "array", items: { type: "string" },
-              description: "Topic tags (specific but not granular)"
-            },
-            domain: {
-              type: "string",
-              enum: ["ai", "business", "personal", "podcast", "health", "technical", "other"]
-            },
-            sentiment: {
-              type: "number", minimum: -1, maximum: 1,
-              description: "Sentiment -1 to 1: negative to positive"
-            },
-            engagement: {
-              type: "number", minimum: 1, maximum: 7,
-              description: "Energy/emotion level 1-7: 1=low-key, 4=engaged, 7=highly passionate"
-            },
-            actionability: {
-              type: "number", minimum: 1, maximum: 7,
-              description: "Contains decisions/commitments/action items 1-7: 1=pure info, 7=highly actionable"
-            },
-            entities: {
-              type: "array", items: { type: "string" },
-              description: "People, companies, products mentioned"
-            },
-            style_tags: {
-              type: "array", items: { type: "string" },
-              description: "Style markers: formal, casual, technical, humor, emphatic, lists, links"
-            },
-            thread_role: {
-              type: "string",
-              enum: ["initiator", "responder"]
-            }
+            msg_index: { type: "integer", description: "The n from the [MSG n] marker" },
+            quality_score: { type: "integer", description: "Overall quality 1-7 (whole number): voice, insight, craft. 1=filler, 4=solid, 7=exceptional" },
+            authorship_score: { type: "number", description: "Confidence 0-1 that the owner wrote this themselves (vs quoted/forwarded/pasted/LLM-generated text)" },
+            originality_score: { type: "integer", description: "Intellectual originality 1-7 (whole number): 1=common wisdom, 4=thoughtful, 7=unique insight" },
+            topics: { type: "array", items: { type: "string" }, description: "1-3 lowercase topic tags; reuse the same tag for the same concept across messages" },
+            domain: { type: "string", enum: ["ai", "business", "personal", "podcast", "health", "technical", "other"] },
+            sentiment: { type: "number", description: "Sentiment -1 to 1: negative to positive" },
+            engagement: { type: "integer", description: "Energy/emotion level 1-7 (whole number): 1=low-key, 4=engaged, 7=highly passionate" },
+            actionability: { type: "integer", description: "Decisions/commitments/action items 1-7 (whole number): 1=pure info, 7=highly actionable" },
+            entities: { type: "array", items: { type: "string" }, description: "Named people, companies, products that appear in THIS message's own text. Empty array if none." },
+            style_tags: { type: "array", items: { type: "string" }, description: "Style markers from: formal, casual, technical, humor, emphatic, lists, links, terse, long-form" },
+            thread_role: { type: "string", enum: ["initiator", "responder"], description: "initiator = this message opens the thread or re-opens it after a gap; responder = replies to the other party's preceding message" }
           }
         }
       }
@@ -6274,6 +6480,8 @@ function buildEnrichmentPrompt(
   messageIds: string[],
   participantNames: string[] = []
 ): string {
+  const n = messageIds.length
+  const owner = OWNER_CONFIG.displayName.split(' ')[0]
   const participantContext = participantNames.length > 0
     ? `\nParticipants (other than the owner): ${participantNames.join(', ')}\nNOTE: The transcript may have spelling errors for names. Use the participant names above for entity extraction.`
     : ''
@@ -6285,29 +6493,28 @@ Source: ${thread.source}
 Title/Subject: ${thread.title || thread.subject || '(none)'}
 Type: ${thread.thread_type}${participantContext}
 
-The conversation is shown below. The owner's messages are marked with [MESSAGE_ID: xxx] at the start.
-You need to analyze each of the owner's messages and return structured metadata.
+The conversation is shown below. The owner (${owner}) has messages to analyze marked [MSG n] at the start; other messages (from other people, or the owner's messages outside the analysis window) have no marker and are context only.
+Return one metadata entry per [MSG n] marker, using that n as msg_index. Return exactly ${n} entries.
 
-SCORING GUIDELINES (use these 10 consolidated fields, 1-7 scales):
-1. quality_score (1-7): Overall quality - voice, insight, craft. 1=filler, 4=solid, 7=exceptional
-2. authorship_score (0-1): Confidence the owner wrote this vs quoted/LLM/forwarded. 1.0=definitely his words
-3. originality_score (1-7): Intellectual uniqueness. 1=common wisdom, 4=thoughtful, 7=few would say this
-4. topics: Specific but not granular topic tags. Use consistent names.
-5. domain: Primary domain (ai, business, personal, podcast, health, technical, other)
-6. sentiment (-1 to 1): Negative to positive tone
-7. engagement (1-7): Energy/emotion level. 1=low-key, 4=engaged, 7=highly passionate
-8. actionability (1-7): Contains decisions/commitments/action items. 1=pure info, 7=highly actionable
-9. entities: People, companies, products mentioned (combined array)
-10. style_tags: Style markers like "formal", "casual", "technical", "humor", "emphatic"
-11. thread_role: "initiator" or "responder"
+SCORING GUIDELINES:
+1. quality_score (1-7, whole number): overall quality — voice, insight, craft. 1=filler ("ok", "thanks"), 4=solid, 7=exceptional. Use the full range: the thread's best message should earn a 6 or 7 and pure filler a 1 or 2.
+2. authorship_score (0-1): confidence the owner wrote this themselves. Lower it for quoted text, forwarded content, pasted links/articles, boilerplate, or LLM-sounding prose.
+3. originality_score (1-7, whole number): intellectual uniqueness. 1=common wisdom, 4=thoughtful, 7=few would say this.
+4. topics: 1-3 lowercase tags, specific but not granular. REUSE the same tag for the same concept across messages (e.g. always "project scheduling", not "scheduling"/"project booking"/"scheduling confirmation"). Do not put names of people/companies/products in topics — those go in entities.
+5. domain: primary domain (ai, business, personal, podcast, health, technical, other).
+6. sentiment (-1 to 1): negative to positive tone of THIS message.
+7. engagement (1-7, whole number): energy/emotion level. 1=low-key, 4=engaged, 7=highly passionate.
+8. actionability (1-7, whole number): decisions, commitments, requests, action items. 1=pure info/chatter, 4=a concrete ask or plan, 7=firm commitment or decision with next steps.
+9. entities: ONLY named people, companies, products, or organizations that appear in THIS message's own text (or an explicit @-mention / obvious nickname for a participant). Do NOT carry over entities from the thread title, from other people's messages, or from the owner's other messages. Do NOT list generic concepts ("AI", "agents", "startups"). An empty array is the correct answer for a message that names nothing.
+10. style_tags: pick from formal, casual, technical, humor, emphatic, lists, links, terse, long-form.
+11. thread_role: "initiator" if the message opens the thread or re-opens it after a gap; "responder" if it replies to the other party's preceding message.
 
 CONVERSATION:
 ---
 ${threadContext}
 ---
 
-Analyze each of the owner's ${messageIds.length} message(s) marked with MESSAGE_ID and return the structured metadata.
-For thread_analysis, consider the overall conversation context.`
+Analyze the ${n} message(s) marked [MSG n] and return the structured metadata. For thread_analysis, consider the overall conversation.`
 }
 
 async function cmdSynthesize(args: ParsedArgs): Promise<void> {
@@ -6347,6 +6554,13 @@ async function cmdQuery(args: ParsedArgs): Promise<void> {
     console.error('Error: Search term required')
     console.error('Usage: deep-context query <search_term>')
     process.exit(1)
+  }
+
+  // Semantic / hybrid vector search takes a separate path (must open the
+  // vector sidecar BEFORE the main DB — custom SQLite ordering requirement)
+  if (args.flags.semantic || args.flags.hybrid) {
+    await runSemanticQuery(searchTerm, args)
+    return
   }
 
   const sourceFilter = args.flags.source as string | undefined
@@ -6427,8 +6641,8 @@ async function cmdRecent(args: ParsedArgs): Promise<void> {
   console.log(`Recent threads (last ${hours}h): ${results.length} found\n`)
 
   for (const t of results) {
-    const title = t.subject || t.title || '(no subject)'
-    const participants = t.participant_ids ? JSON.parse(t.participant_ids).filter((p: string) => p !== OWNER_CONFIG.personId).join(', ') : ''
+    const title = resolvePhonesInText(t.subject || t.title || '(no subject)')
+    const participants = t.participant_ids ? JSON.parse(t.participant_ids).filter((p: string) => p !== OWNER_CONFIG.personId).map((p: string) => resolvePhonesInText(p, { compact: true })).join(', ') : ''
     const myMsgs = t.my_message_count > 0 ? ` (${t.my_message_count} from me)` : ' (inbound only)'
     console.log(`[${t.source}] ${t.last_activity_at}`)
     console.log(`  ${title}`)
@@ -6442,7 +6656,7 @@ async function cmdTodo(args: ParsedArgs): Promise<void> {
   const subcommand = args.positional[0]
 
   if (!subcommand) {
-    console.error('Usage: deep-context todo <list|add|update|recap|strategic>')
+    console.error('Usage: deep-context todo <list|add|update|expire|recap|strategic>')
     process.exit(1)
   }
 
@@ -6480,9 +6694,9 @@ async function cmdTodo(args: ParsedArgs): Promise<void> {
       for (const item of items) {
         const age = Math.floor((Date.now() - new Date(item.detected_at).getTime()) / (1000 * 60 * 60 * 24))
         const dueStr = item.due_date ? ` (due: ${item.due_date})` : ''
-        const personStr = item.related_person ? ` — ${item.related_person}` : ''
+        const personStr = item.related_person ? ` — ${resolvePhonesInText(item.related_person)}` : ''
         const statusIcon = item.status === 'accepted' ? '★' : item.status === 'pending' ? '○' : '✓'
-        console.log(`${statusIcon} [${item.category}] ${item.title}${dueStr}${personStr}`)
+        console.log(`${statusIcon} [${item.category}] ${resolvePhonesInText(item.title)}${dueStr}${personStr}`)
         console.log(`  ${item.source} | ${age}d ago | ${item.priority} | id: ${item.id.substring(0, 12)}`)
         if (item.context) console.log(`  ${item.context.substring(0, 150)}`)
         console.log()
@@ -6542,12 +6756,16 @@ async function cmdTodo(args: ParsedArgs): Promise<void> {
         process.exit(1)
       }
 
-      const updates: string[] = [`status = '${status}'`]
+      const updates: string[] = ['status = ?']
+      const params: any[] = [status]
       if (status === 'completed') updates.push(`completed_at = datetime('now')`)
-      if (status === 'dismissed' && args.flags.reason) updates.push(`dismissed_reason = '${args.flags.reason}'`)
+      if (status === 'dismissed' && args.flags.reason) {
+        updates.push('dismissed_reason = ?')
+        params.push(args.flags.reason as string)
+      }
 
       // Support partial ID matching
-      const result = db.query(`UPDATE todo_items SET ${updates.join(', ')} WHERE id LIKE ?`).run(`${id}%`)
+      const result = db.query(`UPDATE todo_items SET ${updates.join(', ')} WHERE id LIKE ?`).run(...params, `${id}%`)
       db.close()
 
       if (result.changes > 0) {
@@ -6555,6 +6773,37 @@ async function cmdTodo(args: ParsedArgs): Promise<void> {
       } else {
         console.log(`No items found matching id: ${id}`)
       }
+      break
+    }
+
+    case 'expire': {
+      // Soft auto-expiry for stale machine-detected INCOMING requests (never deletes rows).
+      // An `incoming` item still `pending` after N days with no re-sighting (last_seen_at,
+      // falling back to detected_at) and no future due date is flipped to status='expired'
+      // with a dismissed_reason stamp. Reversible: `todo update <id> --status pending`.
+      // `committed` items are never expired — those are the owner's own promises.
+      const days = args.flags.days ? parseInt(String(args.flags.days), 10) : 30
+      if (!Number.isFinite(days) || days < 1) {
+        console.error('Usage: deep-context todo expire [--days N (default 30)] [--dry-run]')
+        process.exit(1)
+      }
+      const where = `status = 'pending' AND category = 'incoming'
+        AND COALESCE(last_seen_at, detected_at) < datetime('now', ?)
+        AND (due_date IS NULL OR due_date = '' OR due_date < date('now'))`
+      const cutoffArg = `-${days} days`
+      const stale = db.query(`SELECT id, title, detected_at, related_person FROM todo_items WHERE ${where} ORDER BY detected_at ASC`).all(cutoffArg) as any[]
+      if (args.flags['dry-run']) {
+        console.log(`[dry-run] ${stale.length} pending incoming item(s) older than ${days}d would be marked expired:`)
+        for (const i of stale.slice(0, 40)) console.log(`  ${String(i.detected_at).slice(0, 10)}  ${i.title}${i.related_person ? ' — ' + i.related_person : ''}  (${i.id.slice(0, 12)})`)
+        if (stale.length > 40) console.log(`  … and ${stale.length - 40} more`)
+        db.close()
+        break
+      }
+      const res = db.query(`UPDATE todo_items SET status = 'expired',
+          dismissed_reason = 'auto-expired ' || date('now') || ': incoming, no activity for ${days}d'
+        WHERE ${where}`).run(cutoffArg)
+      db.close()
+      console.log(`Expired ${res.changes} stale incoming item(s) (>${days}d, no activity). Undo one: todo update <id> --status pending`)
       break
     }
 
@@ -6580,7 +6829,7 @@ async function cmdTodo(args: ParsedArgs): Promise<void> {
       if (committed.length > 0) {
         console.log(`Committed (${committed.length}):`)
         for (const item of committed) {
-          console.log(`  ○ ${item.title} (${item.source}${item.related_person ? ', ' + item.related_person : ''})`)
+          console.log(`  ○ ${resolvePhonesInText(item.title)} (${item.source}${item.related_person ? ', ' + resolvePhonesInText(item.related_person) : ''})`)
         }
         console.log()
       }
@@ -6588,7 +6837,7 @@ async function cmdTodo(args: ParsedArgs): Promise<void> {
       if (incoming.length > 0) {
         console.log(`Incoming (${incoming.length}):`)
         for (const item of incoming) {
-          console.log(`  ○ ${item.title} (${item.source}${item.related_person ? ', from ' + item.related_person : ''})`)
+          console.log(`  ○ ${resolvePhonesInText(item.title)} (${item.source}${item.related_person ? ', from ' + resolvePhonesInText(item.related_person) : ''})`)
         }
         console.log()
       }
@@ -6601,7 +6850,7 @@ async function cmdTodo(args: ParsedArgs): Promise<void> {
         console.log(`Active accepted items (${activeItems.length}):`)
         for (const item of activeItems) {
           const age = Math.floor((Date.now() - new Date(item.detected_at).getTime()) / (1000 * 60 * 60 * 24))
-          console.log(`  ★ [${age}d] ${item.title}${item.related_person ? ' — ' + item.related_person : ''}`)
+          console.log(`  ★ [${age}d] ${resolvePhonesInText(item.title)}${item.related_person ? ' — ' + resolvePhonesInText(item.related_person) : ''}`)
         }
         console.log()
       }
@@ -6682,7 +6931,7 @@ async function cmdTodo(args: ParsedArgs): Promise<void> {
 
     default:
       console.error(`Unknown todo subcommand: ${subcommand}`)
-      console.error('Usage: deep-context todo <list|add|update|recap|strategic>')
+      console.error('Usage: deep-context todo <list|add|update|expire|recap|strategic>')
       process.exit(1)
   }
 }
@@ -6706,6 +6955,182 @@ async function cmdExport(args: ParsedArgs): Promise<void> {
 
   console.log(`Exporting ${type} to ${outputPath} (${format})`)
   console.log('\nExport not yet implemented.')
+}
+
+// ============================================================
+// EXPORT-PUBLIC - Build a public-only DB (default: podcast + own tweets) with
+// FTS5, and optionally scp it to another machine for low-access agents.
+// ============================================================
+
+// Public sources are the ONLY thing that leaves this machine. Keep this list
+// tight — anything not here is private and must never be exported. Override in
+// config.json: { "public_sources": ["twitter"] }
+const DEFAULT_PUBLIC_SOURCES = ['podcast', 'twitter']
+
+function publicSources(): string[] {
+  try {
+    if (existsSync(CONFIG_PATH)) {
+      const cfg = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
+      if (Array.isArray(cfg.public_sources) && cfg.public_sources.length > 0) return cfg.public_sources.map(String)
+    }
+  } catch { /* fall through to default */ }
+  return DEFAULT_PUBLIC_SOURCES
+}
+
+async function cmdExportPublic(args: ParsedArgs): Promise<void> {
+  const pushDest = typeof args.flags.push === 'string' ? (args.flags.push as string) : ''
+  const PUBLIC_SOURCES = publicSources()
+  const finalPath = (args.flags.output as string | undefined) || join(DATA_DIR, 'public_deep_context.db')
+  const buildPath = `${finalPath}.building`
+
+  if (!existsSync(DB_PATH)) {
+    console.error(`Error: source DB not found at ${DB_PATH}`)
+    process.exit(1)
+  }
+
+  console.log('=== Build public-only deep-context DB ===')
+  console.log(`Sources: ${PUBLIC_SOURCES.join(', ')}`)
+
+  // Build into a temp file, then atomically rename over the real one so a
+  // half-built file is never shipped. No WAL on the build DB → the result is a
+  // single self-contained .db file (no -wal/-shm sidecars to ship).
+  const out = new Database(buildPath, { create: true })
+  try {
+    out.exec('PRAGMA busy_timeout = 30000')
+    // Defensive: a stale build file from a crashed run may have old tables.
+    out.exec(`
+      DROP TABLE IF EXISTS messages_fts;
+      DROP TABLE IF EXISTS messages;
+      DROP TABLE IF EXISTS threads;
+      DROP TABLE IF EXISTS meta;
+    `)
+    out.exec(`
+      CREATE TABLE messages (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT,
+        source TEXT NOT NULL,
+        content_type TEXT,
+        timestamp DATETIME,
+        position_in_thread INTEGER,
+        sender TEXT,              -- denormalized display name (or sender_id fallback)
+        is_from_me BOOLEAN,
+        content TEXT NOT NULL,
+        reply_to_message_id TEXT,
+        quoted_content TEXT,
+        word_count INTEGER
+      );
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        source TEXT,
+        title TEXT,
+        source_url TEXT,
+        thread_type TEXT,
+        started_at DATETIME,
+        last_activity_at DATETIME,
+        message_count INTEGER
+      );
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+      CREATE INDEX idx_pub_msg_source ON messages(source);
+      CREATE INDEX idx_pub_msg_thread ON messages(thread_id);
+      CREATE INDEX idx_pub_msg_type ON messages(content_type);
+      CREATE INDEX idx_pub_msg_time ON messages(timestamp DESC);
+    `)
+
+    // Pull public rows from the live DB. Parameterized IN-list keeps the source
+    // allow-list explicit. Denormalize sender via people so the reader needs no join.
+    out.exec(`ATTACH DATABASE '${DB_PATH.replace(/'/g, "''")}' AS src`)
+    const placeholders = PUBLIC_SOURCES.map(() => '?').join(', ')
+
+    out.run(
+      `INSERT INTO messages (id, thread_id, source, content_type, timestamp,
+                             position_in_thread, sender, is_from_me, content,
+                             reply_to_message_id, quoted_content, word_count)
+       SELECT m.id, m.thread_id, m.source, m.content_type, m.timestamp,
+              m.position_in_thread, COALESCE(p.display_name, m.sender_id),
+              m.is_from_me, m.content, m.reply_to_message_id, m.quoted_content, m.word_count
+       FROM src.messages m
+       LEFT JOIN src.people p ON m.sender_id = p.id
+       WHERE m.source IN (${placeholders})`,
+      [...PUBLIC_SOURCES]
+    )
+
+    out.run(
+      `INSERT INTO threads (id, source, title, source_url, thread_type,
+                            started_at, last_activity_at, message_count)
+       SELECT DISTINCT t.id, t.source, t.title, t.source_url, t.thread_type,
+              t.started_at, t.last_activity_at, t.message_count
+       FROM src.threads t
+       WHERE t.id IN (SELECT DISTINCT thread_id FROM messages)`
+    )
+
+    // Full-text index over content + thread title. content_id maps back to messages.id.
+    out.exec(`
+      CREATE VIRTUAL TABLE messages_fts USING fts5(
+        content,
+        title,
+        content_id UNINDEXED,
+        tokenize = 'porter unicode61'
+      );
+      INSERT INTO messages_fts (content, title, content_id)
+      SELECT m.content, COALESCE(t.title, ''), m.id
+      FROM messages m
+      LEFT JOIN threads t ON m.thread_id = t.id;
+    `)
+    out.exec(`INSERT INTO messages_fts(messages_fts) VALUES('optimize')`)
+
+    // Metadata so an agent can see freshness + scope.
+    const builtAt = new Date().toISOString()
+    const counts = out
+      .query(`SELECT source, content_type, COUNT(*) AS c FROM messages GROUP BY source, content_type ORDER BY source, content_type`)
+      .all() as Array<{ source: string; content_type: string; c: number }>
+    const totalMsg = (out.query(`SELECT COUNT(*) AS c FROM messages`).get() as { c: number }).c
+    const totalThreads = (out.query(`SELECT COUNT(*) AS c FROM threads`).get() as { c: number }).c
+    const insertMeta = out.prepare(`INSERT INTO meta (key, value) VALUES (?, ?)`)
+    insertMeta.run('built_at', builtAt)
+    insertMeta.run('sources', PUBLIC_SOURCES.join(','))
+    insertMeta.run('message_count', String(totalMsg))
+    insertMeta.run('thread_count', String(totalThreads))
+    insertMeta.run('counts', JSON.stringify(counts))
+
+    out.exec('DETACH DATABASE src')
+    out.close()
+
+    // Atomic replace.
+    renameSync(buildPath, finalPath)
+
+    const sizeMB = (statSync(finalPath).size / (1024 * 1024)).toFixed(1)
+    console.log(`\nBuilt ${totalMsg.toLocaleString()} messages across ${totalThreads.toLocaleString()} threads (${sizeMB} MB)`)
+    for (const row of counts) {
+      console.log(`  ${row.source.padEnd(8)} ${(row.content_type || '(none)').padEnd(22)} ${row.c.toLocaleString()}`)
+    }
+    console.log(`\nfile://${encodeURI(finalPath)}`)
+  } catch (e) {
+    try { out.close() } catch {}
+    throw e
+  }
+
+  if (pushDest) {
+    // USER@HOST:DIR — uses your normal ssh config/keys.
+    const m = pushDest.match(/^([^:]+):(.+)$/)
+    if (!m) {
+      console.error('Error: --push expects USER@HOST:DIR (e.g. agent@my-other-mac:~/.agent-data)')
+      process.exit(1)
+    }
+    const [, host, dir] = m
+    console.log(`\n=== Pushing to ${host} ===`)
+    const mkdir = Bun.spawnSync(['ssh', host, `mkdir -p ${dir}`])
+    if (mkdir.exitCode !== 0) {
+      console.error('Error: remote mkdir failed:', new TextDecoder().decode(mkdir.stderr))
+      process.exit(1)
+    }
+    const dest = `${host}:${dir.replace(/\/$/, '')}/public_deep_context.db`
+    const scp = Bun.spawnSync(['scp', finalPath, dest])
+    if (scp.exitCode !== 0) {
+      console.error('Error: scp failed:', new TextDecoder().decode(scp.stderr))
+      process.exit(1)
+    }
+    console.log(`Pushed → ${dest}`)
+  }
 }
 
 async function cmdUpdate(args: ParsedArgs): Promise<void> {
@@ -7573,6 +7998,42 @@ async function resolveBeeperContact(chatId: string, phoneOrId: string): Promise<
 
   beeperContactCache.set(cacheKey, formatted)
   return formatted
+}
+
+// ============================================================================
+// Display-time phone → name resolution (read-only stopgap)
+// ============================================================================
+// Beeper/iMessage threads are often stored with titles like "+1 555-010-0001" or
+// "+1 555-010-0002, +1 555-010-0003 & +1 555-010-0004", and participant IDs
+// like "1-555-010-0001". Rather than rewriting stored data, resolve numbers
+// against contacts.db when printing. Unknown numbers stay as-is.
+
+/** Matches "+1 555-010-0001", "1-555-010-0001", "555-010-0001", "(555) 010-0001", "15550100001" */
+const PHONE_IN_TEXT_RE = /(?<![\w+])(?:\+?1[\s.-]?)?(?:\(\d{3}\)\s?|\d{3}[\s.-])\d{3}[\s.-]\d{4}(?!\d)|(?<![\w+])\+?1\d{10}(?!\d)/g
+
+const phoneDisplayCache = new Map<string, string | null>()
+
+function lookupContactByPhoneCached(phone: string): string | null {
+  const key = normalizePhoneForLookup(phone)
+  if (!phoneDisplayCache.has(key)) phoneDisplayCache.set(key, lookupContactByPhone(phone))
+  return phoneDisplayCache.get(key)!
+}
+
+/**
+ * Replace phone numbers embedded in display text with contact names.
+ * Default: "Name (+1 555-010-0001)". compact: "Name". Unresolved numbers are left untouched.
+ */
+export function resolvePhonesInText(
+  text: string,
+  opts: { compact?: boolean; lookup?: (phone: string) => string | null } = {},
+): string {
+  if (!text) return text
+  const lookup = opts.lookup ?? lookupContactByPhoneCached
+  return text.replace(PHONE_IN_TEXT_RE, match => {
+    const name = lookup(match)
+    if (!name) return match
+    return opts.compact ? name : `${name} (${match.trim()})`
+  })
 }
 
 // Clean up iMessage binary artifacts (NSObject, NSData, bplist, attachment references)
@@ -10394,7 +10855,7 @@ async function contactsEnrichTwitter(db: Database, args: ParsedArgs): Promise<vo
   }
 
   if (!existsSync(archivePath)) {
-    console.error(`Error: Twitter archive not found at: ${archivePath}`)
+    console.log(`  Skipping archive mention scan (not present at ${archivePath})`)
     return
   }
 
@@ -10810,10 +11271,504 @@ async function contactsEnrichSlack(db: Database, args: ParsedArgs): Promise<void
 }
 
 // ============================================================
+// SEMANTIC EMBEDDINGS (sidecar vector DB — deep_context_vectors_<provider>.db)
+// ============================================================
+// Embeddings: Gemini gemini-embedding-2 (default) or local Ollama. Index: sqlite-vec vec0.
+// Rerank (optional): Voyage rerank-3. See tools/deep-context-semantic.ts.
+// The main deep_context.db is ONLY ever opened read-only by these commands —
+// all writes go to the sidecar (additive by design).
+
+async function requireEmbedApiKey(): Promise<string> {
+  const key = await getEmbedApiKey()
+  if (key === null) {
+    console.error('Error: semantic search needs an embedding provider.')
+    console.error('  Option A: add GEMINI_API_KEY to tools/.env (cheap; https://aistudio.google.com/apikey)')
+    console.error('  Option B: run locally for free — install Ollama, `ollama pull nomic-embed-text`,')
+    console.error('            and set DEEP_CONTEXT_EMBED_PROVIDER=ollama')
+    console.error('Keyword search works without either: deep-context query "<term>"')
+    process.exit(1)
+  }
+  return key
+}
+
+/** Parse the "[source] subject (date)" header out of a chunk's text. */
+function splitChunkText(chunkText: string): { context: string; body: string } {
+  const nl = chunkText.indexOf('\n')
+  const header = nl >= 0 ? chunkText.substring(0, nl) : chunkText
+  const body = nl >= 0 ? chunkText.substring(nl + 1) : ''
+  // header looks like: [gmail] Subject line (2026-05-12)
+  const context = header.replace(/^\[[^\]]*\]\s*/, '').replace(/\s*\(\d{4}-\d{2}-\d{2}\)$/, '')
+  return { context: context === '(no subject)' ? '' : context, body: body.replace(/\n/g, ' ') }
+}
+
+async function runSemanticQuery(searchTerm: string, args: ParsedArgs): Promise<void> {
+  const sourceFilter = args.flags.source as string | undefined
+  const fromDate = args.flags.from as string | undefined
+  const toDate = args.flags.to as string | undefined
+  const limit = (args.flags.limit as number) || 20
+  const hybrid = !!args.flags.hybrid
+  const useRerank = !args.flags['no-rerank'] && process.env.DEEP_CONTEXT_RERANK !== '0'
+  // Start the (optional) rerank key lookup now so it overlaps the embed + KNN
+  const voyageKeyP = useRerank ? fetchVoyageKey() : Promise.resolve(null)
+
+  if (!existsSync(vectorDbPath())) {
+    console.error(`Error: No vector index at ${vectorDbPath()}`)
+    console.error('Build one first: deep-context embed-backfill [--from DATE] [--max-cost N]')
+    process.exit(1)
+  }
+
+  // IMPORTANT: open the vector sidecar before any other Database in this process
+  const vdb = openVectorDb(vectorDbPath())
+  const apiKey = await requireEmbedApiKey()
+
+  const tEmbed = Date.now()
+  const queryVec = await embedQuery(apiKey, searchTerm)
+  const embedMs = Date.now() - tEmbed
+
+  // Over-fetch so post-KNN source/date filters still leave enough results
+  const k = Math.min(Math.max(limit * 10, 100), 500)
+  const tSearch = Date.now()
+  let sql = `
+    SELECT c.id, c.thread_id, c.source, c.first_timestamp, c.last_timestamp,
+           c.chunk_text, c.message_ids, knn.distance
+    FROM (SELECT rowid, distance FROM vec_chunks WHERE embedding MATCH ? AND k = ?) AS knn
+    JOIN embed_chunks c ON c.id = knn.rowid
+    WHERE c.stale = 0
+  `
+  const params: any[] = [vecToBlob(queryVec), k]
+  if (sourceFilter) {
+    sql += ` AND c.source = ?`
+    params.push(sourceFilter)
+  }
+  if (fromDate) {
+    sql += ` AND c.last_timestamp >= ?`
+    params.push(fromDate)
+  }
+  if (toDate) {
+    sql += ` AND c.first_timestamp <= ?`
+    params.push(toDate)
+  }
+  sql += ` ORDER BY knn.distance ASC LIMIT ?`
+  params.push(useRerank ? Math.max(limit, RERANK_POOL) : limit)
+
+  let semRows = vdb.query(sql).all(...params) as any[]
+  const searchMs = Date.now() - tSearch
+  vdb.close()
+  const voyageKey = await voyageKeyP
+  // No Voyage key is the normal, supported default: results stay in vector order.
+
+  if (!hybrid) {
+    let rerankMs = 0
+    let reranked = false
+    if (voyageKey && semRows.length) {
+      const tR = Date.now()
+      const order = await rerank(voyageKey, searchTerm, semRows.map(r => r.chunk_text), limit)
+      rerankMs = Date.now() - tR
+      if (order) {
+        semRows = order.map(o => ({ ...semRows[o.index], relevance: o.score }))
+        reranked = true
+      }
+    }
+    semRows = semRows.slice(0, limit)
+    console.log(`Found ${semRows.length} conversation chunks semantically matching "${searchTerm}" (embed ${embedMs}ms, search ${searchMs}ms${reranked ? `, rerank ${rerankMs}ms` : ''}):\n`)
+    for (const r of semRows) {
+      const sim = 1 - r.distance
+      const { context, body } = splitChunkText(r.chunk_text)
+      console.log(`→ [${r.source}] ${r.first_timestamp} (${r.relevance !== undefined ? `relevance ${r.relevance.toFixed(3)}, ` : ''}similarity ${sim.toFixed(3)})`)
+      if (context) console.log(`  ${context}`)
+      const preview = body.substring(0, 200)
+      console.log(`  ${preview}${body.length > 200 ? '...' : ''}`)
+      console.log()
+    }
+    return
+  }
+
+  // Hybrid: keyword results + semantic results, merged by reciprocal rank fusion on thread
+  const db = getDb()
+  let kwSql = `
+    SELECT m.id, m.thread_id, m.source, m.content, m.timestamp, m.is_from_me,
+           t.subject, t.title
+    FROM messages m
+    JOIN threads t ON m.thread_id = t.id
+    WHERE m.content LIKE ?
+  `
+  const kwParams: any[] = [`%${searchTerm}%`]
+  if (sourceFilter) {
+    kwSql += ` AND m.source = ?`
+    kwParams.push(sourceFilter)
+  }
+  if (fromDate) {
+    kwSql += ` AND m.timestamp >= ?`
+    kwParams.push(fromDate)
+  }
+  if (toDate) {
+    kwSql += ` AND m.timestamp <= ?`
+    kwParams.push(toDate)
+  }
+  kwSql += ` ORDER BY m.timestamp DESC LIMIT ?`
+  kwParams.push(voyageKey ? Math.max(limit, 25) : limit) // wider keyword pool when the reranker sorts it
+  let kwRows = db.query(kwSql).all(...kwParams) as any[]
+  db.close()
+
+  type Merged = { score: number; sem?: any; kw?: any }
+  const byThread = new Map<string, Merged>()
+
+  // Reranked hybrid: score semantic chunks + keyword messages together with rerank-3,
+  // then keep each thread's best-scoring hit. Falls through to RRF if rerank fails.
+  let rerankedHybrid = false
+  if (voyageKey) {
+    const cands = [
+      ...semRows.map(r => ({ thread: r.thread_id, sem: r, kw: undefined as any, text: r.chunk_text as string })),
+      ...kwRows.map(r => ({ thread: r.thread_id, sem: undefined as any, kw: r,
+        text: `${r.subject || r.title || ''}\n${String(r.content).substring(0, 4000)}` })),
+    ]
+    const order = await rerank(voyageKey, searchTerm, cands.map(c => c.text), cands.length)
+    if (order) {
+      rerankedHybrid = true
+      for (const o of order) {
+        const c = cands[o.index]
+        const e = byThread.get(c.thread) || { score: -1 }
+        if (o.score > e.score) e.score = o.score
+        if (c.sem && !e.sem) e.sem = c.sem
+        if (c.kw && !e.kw) e.kw = c.kw
+        byThread.set(c.thread, e)
+      }
+    }
+  }
+  if (!rerankedHybrid) {
+    semRows = semRows.slice(0, limit)
+    kwRows = kwRows.slice(0, limit)
+  }
+
+  const RRF_K = 60
+  if (!rerankedHybrid) semRows.forEach((r, i) => {
+    const e = byThread.get(r.thread_id) || { score: 0 }
+    e.score += 1 / (RRF_K + i + 1)
+    if (!e.sem) e.sem = r
+    byThread.set(r.thread_id, e)
+  })
+  if (!rerankedHybrid) kwRows.forEach((r, i) => {
+    const e = byThread.get(r.thread_id) || { score: 0 }
+    e.score += 1 / (RRF_K + i + 1)
+    if (!e.kw) e.kw = r
+    byThread.set(r.thread_id, e)
+  })
+
+  const merged = [...byThread.values()].sort((a, b) => b.score - a.score).slice(0, limit)
+  console.log(`Found ${merged.length} conversations matching "${searchTerm}" (hybrid: ${semRows.length} semantic + ${kwRows.length} keyword${rerankedHybrid ? ', reranked' : ''}):\n`)
+  for (const e of merged) {
+    const label = e.sem && e.kw ? 'both' : e.sem ? 'semantic' : 'keyword'
+    if (e.sem) {
+      const sim = 1 - e.sem.distance
+      const { context, body } = splitChunkText(e.sem.chunk_text)
+      console.log(`→ [${e.sem.source}] ${e.sem.first_timestamp} (${label}${rerankedHybrid ? `, relevance ${e.score.toFixed(3)}` : ''}, similarity ${sim.toFixed(3)})`)
+      if (context) console.log(`  ${context}`)
+      const preview = body.substring(0, 200)
+      console.log(`  ${preview}${body.length > 200 ? '...' : ''}`)
+    } else {
+      const r = e.kw
+      const direction = r.is_from_me ? '→' : '←'
+      const context = r.subject || r.title || ''
+      console.log(`${direction} [${r.source}] ${r.timestamp} (${label}${rerankedHybrid ? `, relevance ${e.score.toFixed(3)}` : ''})`)
+      if (context) console.log(`  ${context}`)
+      const preview = r.content.substring(0, 200).replace(/\n/g, ' ')
+      console.log(`  ${preview}${r.content.length > 200 ? '...' : ''}`)
+    }
+    console.log()
+  }
+}
+
+async function cmdEmbedBackfill(args: ParsedArgs): Promise<void> {
+  const sourceFilter = args.flags.source as string | undefined
+  const fromDate = args.flags.from as string | undefined
+  const toDate = args.flags.to as string | undefined
+  const chunkLimit = args.flags.limit as number | undefined
+  const dryRun = !!args.flags['dry-run']
+  const batchSize = args.flags['batch-size'] ? parseInt(args.flags['batch-size'] as string, 10) : DEFAULT_BATCH_SIZE
+  const maxCost = args.flags['max-cost'] ? parseFloat(args.flags['max-cost'] as string) : undefined
+
+  // Resolve the provider + key BEFORE creating any files, so an unconfigured install
+  // exits cleanly without leaving an empty sidecar behind.
+  const embedCfg = embedConfig()
+  const apiKey = dryRun ? '' : await requireEmbedApiKey()
+
+  // IMPORTANT: open the vector sidecar before the main DB (custom SQLite ordering)
+  const vdb = openVectorDb(vectorDbPath())
+
+  if (!existsSync(DB_PATH)) {
+    console.error(`Error: Database not found at ${DB_PATH}`)
+    process.exit(1)
+  }
+  // Read-only open: this command never writes to the main DB
+  const db = new Database(DB_PATH, { readonly: true })
+  db.exec('PRAGMA busy_timeout = 30000')
+
+  // Candidate threads (with filter-scoped message counts)
+  let threadSql = `
+    SELECT t.id, t.source, t.subject, t.title, COUNT(m.id) as msg_count, MAX(m.timestamp) as last_ts
+    FROM threads t
+    JOIN messages m ON m.thread_id = t.id
+    WHERE 1=1
+  `
+  const tParams: any[] = []
+  if (sourceFilter) {
+    threadSql += ` AND t.source = ?`
+    tParams.push(sourceFilter)
+  }
+  if (fromDate) {
+    threadSql += ` AND m.timestamp >= ?`
+    tParams.push(fromDate)
+  }
+  if (toDate) {
+    threadSql += ` AND m.timestamp <= ?`
+    tParams.push(toDate)
+  }
+  threadSql += ` GROUP BY t.id ORDER BY last_ts DESC`
+  const allThreads = db.query(threadSql).all(...tParams) as any[]
+
+  const stateRows = vdb.query(`SELECT thread_id, message_count FROM embed_thread_state`).all() as any[]
+  const stateMap = new Map(stateRows.map(r => [r.thread_id, r.message_count]))
+  const candidates = allThreads.filter(t => stateMap.get(t.id) !== t.msg_count)
+
+  console.log(`Semantic index backfill (${embedCfg.provider}: ${embedCfg.model}, ${embedCfg.dims} dims)`)
+  console.log(`Threads in scope: ${allThreads.length} | up to date: ${allThreads.length - candidates.length} | to process: ${candidates.length}${dryRun ? ' [DRY RUN]' : ''}\n`)
+
+  let msgSql = `
+    SELECT m.id, m.timestamp, m.content, m.is_from_me,
+           COALESCE(p.display_name, m.sender_id, 'Unknown') as sender_name
+    FROM messages m
+    LEFT JOIN people p ON p.id = m.sender_id
+    WHERE m.thread_id = ?
+  `
+  if (fromDate) msgSql += ` AND m.timestamp >= ?`
+  if (toDate) msgSql += ` AND m.timestamp <= ?`
+  msgSql += ` ORDER BY m.timestamp ASC, m.position_in_thread ASC`
+  const msgStmt = db.query(msgSql)
+
+  const existingStmt = vdb.query(`SELECT id, content_hash FROM embed_chunks WHERE thread_id = ? AND stale = 0`)
+  const insertChunkStmt = vdb.query(`
+    INSERT INTO embed_chunks (content_hash, thread_id, source, message_ids, message_count,
+                              first_timestamp, last_timestamp, chunk_text, char_count, model, dims)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+  const insertVecStmt = vdb.query(`INSERT INTO vec_chunks (rowid, embedding) VALUES (?, ?)`)
+  const markStaleStmt = vdb.query(`UPDATE embed_chunks SET stale = 1 WHERE id = ?`)
+  const deleteVecStmt = vdb.query(`DELETE FROM vec_chunks WHERE rowid = ?`)
+  const upsertStateStmt = vdb.query(`
+    INSERT INTO embed_thread_state (thread_id, message_count, last_message_timestamp, updated_at)
+    VALUES (?, ?, ?, datetime('now'))
+    ON CONFLICT(thread_id) DO UPDATE SET
+      message_count = excluded.message_count,
+      last_message_timestamp = excluded.last_message_timestamp,
+      updated_at = excluded.updated_at
+  `)
+
+  type PendingThread = { pending: number; msgCount: number; lastTs: string; staleIds: number[] }
+  const pendingThreads = new Map<string, PendingThread>()
+  let buffer: Chunk[] = []
+  let bufferChars = 0
+  let embeddedChunks = 0
+  let embeddedChars = 0
+  let skippedExisting = 0
+  let plannedChunks = 0
+  let plannedChars = 0
+  let threadsProcessed = 0
+  let stopReason = ''
+
+  // Soft-delete superseded chunks (rows preserved, removed from the vec index only)
+  // and record thread state — done only once ALL of a thread's chunks are embedded,
+  // so an interrupted run resumes cleanly.
+  const finalizeThread = (threadId: string) => {
+    const st = pendingThreads.get(threadId)
+    if (!st) return
+    for (const sid of st.staleIds) {
+      markStaleStmt.run(sid)
+      deleteVecStmt.run(sid)
+    }
+    upsertStateStmt.run(threadId, st.msgCount, st.lastTs)
+    pendingThreads.delete(threadId)
+  }
+
+  const flushOne = async () => {
+    const batch = buffer.slice(0, batchSize)
+    if (batch.length === 0) return
+    const vecs = await embedTexts(apiKey, batch.map(c => c.text), 'RETRIEVAL_DOCUMENT')
+    vdb.exec('BEGIN')
+    try {
+      for (let i = 0; i < batch.length; i++) {
+        const c = batch[i]
+        const res = insertChunkStmt.run(
+          c.hash, c.threadId, c.source, JSON.stringify(c.messageIds), c.messageIds.length,
+          c.firstTimestamp, c.lastTimestamp, c.text, c.text.length, embedCfg.model, embedCfg.dims
+        )
+        insertVecStmt.run(Number(res.lastInsertRowid), vecToBlob(vecs[i]))
+      }
+      vdb.exec('COMMIT')
+    } catch (e) {
+      vdb.exec('ROLLBACK')
+      throw e
+    }
+    for (const c of batch) {
+      embeddedChunks++
+      embeddedChars += c.text.length
+      const st = pendingThreads.get(c.threadId)
+      if (st) {
+        st.pending--
+        if (st.pending === 0) finalizeThread(c.threadId)
+      }
+    }
+    buffer = buffer.slice(batch.length)
+    bufferChars = buffer.reduce((s, c) => s + c.text.length, 0)
+    const tokens = estimateEmbedTokens(embeddedChars)
+    const cost = (tokens / 1e6) * embedCfg.pricePerMTokens
+    console.log(`  embedded ${embeddedChunks} chunks | ~${tokens.toLocaleString()} tokens | est $${cost.toFixed(4)}`)
+  }
+
+  for (const t of candidates) {
+    const mParams: any[] = [t.id]
+    if (fromDate) mParams.push(fromDate)
+    if (toDate) mParams.push(toDate)
+    const msgs = msgStmt.all(...mParams) as any[]
+
+    const chunks = chunkThread({
+      threadId: t.id,
+      source: t.source,
+      subject: t.subject || t.title,
+      ownerName: OWNER_CONFIG.displayName,
+      messages: msgs.map(m => ({
+        id: m.id,
+        timestamp: m.timestamp,
+        content: m.content || '',
+        senderName: m.sender_name || 'Unknown',
+        isFromMe: !!m.is_from_me
+      }))
+    })
+
+    const existing = new Map<string, number>(
+      (existingStmt.all(t.id) as any[]).map(r => [r.content_hash, r.id])
+    )
+    const newHashes = new Set(chunks.map(c => c.hash))
+    const newChunks = chunks.filter(c => !existing.has(c.hash))
+    const staleIds = [...existing.entries()].filter(([h]) => !newHashes.has(h)).map(([, id]) => id)
+    skippedExisting += chunks.length - newChunks.length
+    plannedChunks += newChunks.length
+    plannedChars += newChunks.reduce((s, c) => s + c.text.length, 0)
+    threadsProcessed++
+
+    if (dryRun) continue
+
+    // Spend cap: stop before starting a thread that would exceed it
+    if (maxCost !== undefined) {
+      const projTokens = estimateEmbedTokens(embeddedChars + bufferChars + newChunks.reduce((s, c) => s + c.text.length, 0))
+      if ((projTokens / 1e6) * embedCfg.pricePerMTokens > maxCost) {
+        stopReason = `--max-cost $${maxCost} reached`
+        break
+      }
+    }
+
+    // Chunk-count cap: may take a partial thread (its state is intentionally NOT
+    // recorded, so the next run picks it up; already-embedded hashes are skipped)
+    if (chunkLimit !== undefined && embeddedChunks + buffer.length + newChunks.length > chunkLimit) {
+      const room = chunkLimit - embeddedChunks - buffer.length
+      if (room > 0) {
+        buffer.push(...newChunks.slice(0, room))
+        bufferChars += newChunks.slice(0, room).reduce((s, c) => s + c.text.length, 0)
+      }
+      stopReason = `--limit ${chunkLimit} chunks reached`
+      break
+    }
+
+    pendingThreads.set(t.id, { pending: newChunks.length, msgCount: msgs.length, lastTs: t.last_ts, staleIds })
+    if (newChunks.length === 0) {
+      finalizeThread(t.id)
+      continue
+    }
+    buffer.push(...newChunks)
+    bufferChars += newChunks.reduce((s, c) => s + c.text.length, 0)
+    while (buffer.length >= batchSize) await flushOne()
+  }
+
+  if (!dryRun) {
+    while (buffer.length > 0) await flushOne()
+  }
+
+  db.close()
+
+  if (dryRun) {
+    const tokens = estimateEmbedTokens(plannedChars)
+    const cost = (tokens / 1e6) * embedCfg.pricePerMTokens
+    const apiCalls = Math.ceil(plannedChunks / batchSize)
+    console.log(`\n[DRY RUN] Would embed ${plannedChunks.toLocaleString()} new chunks from ${threadsProcessed.toLocaleString()} threads (${skippedExisting} chunks already embedded)`)
+    console.log(`  ~${tokens.toLocaleString()} tokens → est $${cost.toFixed(4)} | ~${apiCalls.toLocaleString()} API calls (batch size ${batchSize})`)
+    console.log(`  Rough wall-clock at ~1.5s/call: ~${Math.ceil((apiCalls * 1.5) / 60)} min`)
+  } else {
+    const tokens = estimateEmbedTokens(embeddedChars)
+    const cost = (tokens / 1e6) * embedCfg.pricePerMTokens
+    console.log(`\nDone${stopReason ? ` (stopped: ${stopReason})` : ''}.`)
+    console.log(`  Embedded ${embeddedChunks.toLocaleString()} chunks (${skippedExisting} already present, skipped)`)
+    console.log(`  ~${tokens.toLocaleString()} tokens | est $${cost.toFixed(4)} spent`)
+    console.log(`  Vector DB: ${vectorDbPath()}`)
+  }
+
+  vdb.close()
+}
+
+async function cmdEmbedStatus(_args: ParsedArgs): Promise<void> {
+  if (!existsSync(vectorDbPath())) {
+    console.log(`No vector index yet (${vectorDbPath()} does not exist).`)
+    console.log('Build one with: deep-context embed-backfill')
+    return
+  }
+  // Vector sidecar first (custom SQLite ordering), then main DB read-only
+  const embedCfg = embedConfig()
+  const vdb = openVectorDb(vectorDbPath())
+  const db = new Database(DB_PATH, { readonly: true })
+
+  const totals = vdb.query(`
+    SELECT COUNT(*) as chunks, COALESCE(SUM(char_count), 0) as chars
+    FROM embed_chunks WHERE stale = 0
+  `).get() as any
+  const staleCount = (vdb.query(`SELECT COUNT(*) as c FROM embed_chunks WHERE stale = 1`).get() as any).c
+  const threadsEmbedded = (vdb.query(`SELECT COUNT(*) as c FROM embed_thread_state`).get() as any).c
+  const bySource = vdb.query(`
+    SELECT source, COUNT(*) as chunks, SUM(message_count) as messages
+    FROM embed_chunks WHERE stale = 0 GROUP BY source ORDER BY chunks DESC
+  `).all() as any[]
+
+  const mainTotals = db.query(`SELECT COUNT(*) as messages, (SELECT COUNT(*) FROM threads) as threads FROM messages`).get() as any
+  db.close()
+
+  const embeddedMessages = bySource.reduce((s, r) => s + (r.messages || 0), 0)
+  const tokens = estimateEmbedTokens(totals.chars)
+  const cost = (tokens / 1e6) * embedCfg.pricePerMTokens
+
+  console.log(`Semantic vector index (${vectorDbPath()})`)
+  console.log(`  Provider: ${embedCfg.provider} — ${embedCfg.model} @ ${embedCfg.dims} dims`)
+  console.log(`  Chunks: ${totals.chunks.toLocaleString()} active (${staleCount} stale)`)
+  console.log(`  Threads covered: ${threadsEmbedded.toLocaleString()} / ${mainTotals.threads.toLocaleString()} (${((threadsEmbedded / mainTotals.threads) * 100).toFixed(1)}%)`)
+  console.log(`  Messages covered: ~${embeddedMessages.toLocaleString()} / ${mainTotals.messages.toLocaleString()} (${((embeddedMessages / mainTotals.messages) * 100).toFixed(1)}%)`)
+  console.log(`  Embedded text: ${(totals.chars / 1e6).toFixed(1)}M chars ≈ ${tokens.toLocaleString()} tokens ≈ $${cost.toFixed(4)} spent`)
+  console.log(`\n  By source:`)
+  for (const r of bySource) {
+    console.log(`    ${r.source.padEnd(16)} ${String(r.chunks).padStart(8)} chunks  ${String(r.messages).padStart(9)} msgs`)
+  }
+  vdb.close()
+}
+
+// ============================================================
 // MAIN
 // ============================================================
 
 async function main(): Promise<void> {
+  // Let tool settings (not just secrets) live in tools/.env: copy DEEP_CONTEXT_* / OLLAMA_*
+  // keys into process.env unless already set in the real environment.
+  try {
+    const env = await load_env()
+    for (const [k, v] of Object.entries(env)) {
+      if (/^(DEEP_CONTEXT_|OLLAMA_)/.test(k) && v && !process.env[k]) process.env[k] = v
+    }
+  } catch { /* no .env yet — fine */ }
+
   const schema = {
     help: { type: 'boolean' as const, alias: 'h' },
     json: { type: 'boolean' as const },
@@ -10832,6 +11787,11 @@ async function main(): Promise<void> {
     'dry-run': { type: 'boolean' as const },
     backfill: { type: 'boolean' as const },
     debug: { type: 'boolean' as const },
+    // Google account to extract as (gmail). Read straight from argv by
+    // resolve_account() in _lib/google_oauth; declared here so the parser
+    // accepts it. e.g. `extract gmail --account travel`
+    account: { type: 'string' as const },
+    as: { type: 'string' as const },
     // Contacts command flags
     'use-llm': { type: 'boolean' as const },
     'min-confidence': { type: 'string' as const },
@@ -10861,6 +11821,14 @@ async function main(): Promise<void> {
     // Backfill flags
     restart: { type: 'boolean' as const },
     'chunk-months': { type: 'string' as const },
+    // export-public flags
+    push: { type: 'string' as const },
+    // Semantic search / embedding flags
+    semantic: { type: 'boolean' as const },
+    hybrid: { type: 'boolean' as const },
+    'no-rerank': { type: 'boolean' as const },
+    'batch-size': { type: 'string' as const },
+    'max-cost': { type: 'string' as const },
   }
 
   let args: ParsedArgs
@@ -10917,6 +11885,9 @@ async function main(): Promise<void> {
     case 'export':
       await cmdExport(cmdArgs)
       break
+    case 'export-public':
+      await cmdExportPublic(cmdArgs)
+      break
     case 'extract-for-summary':
       await cmdExtractForSummary(cmdArgs)
       break
@@ -10944,6 +11915,13 @@ async function main(): Promise<void> {
     case 'dedup-beeper-imessage':
       await cmdDedupBeeperImessage(cmdArgs)
       break
+    case 'embed-backfill':
+    case 'embed-update':
+      await cmdEmbedBackfill(cmdArgs)
+      break
+    case 'embed-status':
+      await cmdEmbedStatus(cmdArgs)
+      break
     default:
       console.error(`Unknown command: ${command}`)
       print_help('deep-context', USAGE)
@@ -10951,7 +11929,9 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch(err => {
-  console.error('Error:', err.message)
-  process.exit(1)
-})
+if (import.meta.main) {
+  main().catch(err => {
+    console.error('Error:', err.message)
+    process.exit(1)
+  })
+}

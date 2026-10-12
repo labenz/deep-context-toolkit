@@ -64,9 +64,28 @@ function getMimeType(filePath: string): string {
   return mimeTypes[ext] || 'application/octet-stream'
 }
 
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+/**
+ * Plain-text-only messages get hard-wrapped at ~72 chars by Gmail in transit
+ * (the SENT copy stays intact, but the delivered copy gains mid-sentence line
+ * breaks — verified 2026-07-14). HTML parts are never re-wrapped, so every
+ * text body ships with a minimal HTML twin mirroring Gmail's own composer
+ * markup (<div> per paragraph, <br> for single newlines).
+ */
+function plainTextToHtml(text: string): string {
+  return text
+    .split(/\n{2,}/)
+    .map(p => `<div dir="ltr">${escapeHtml(p).replace(/\n/g, '<br>')}</div>`)
+    .join('<div><br></div>')
+}
+
 export function composeMimeMessage(options: MimeMessageOptions): string {
-  const { from, to, cc, bcc, subject, textBody, htmlBody, inReplyTo, references, attachments } = options
-  
+  const { from, to, cc, bcc, subject, textBody, inReplyTo, references, attachments } = options
+  const htmlBody = options.htmlBody || (textBody ? plainTextToHtml(textBody) : undefined)
+
   const boundary = `----=_Part_${Date.now()}_${Math.random().toString(36).substring(7)}`
   const lines: string[] = []
   
@@ -191,7 +210,19 @@ export function composeMimeMessage(options: MimeMessageOptions): string {
 
 export function markdownToHtml(markdown: string): string {
   let html = markdown
-  
+
+  // Protect link destinations from the emphasis regexes below (URLs like
+  // youtube.com/watch?v=9Nvvg0j9_8Q&...&v=..._ were being split by `_(.+?)_`
+  // into broken <em> tags). Swap each [text](url) URL for a placeholder.
+  const linkUrls: string[] = []
+  html = html.replace(/\]\(([^)]+)\)/g, (_m, url) => {
+    linkUrls.push(url)
+    return `](\u0000LINK${linkUrls.length - 1}\u0000)`
+  })
+
+  // Horizontal rules: a line that is only *** / --- / ___
+  html = html.replace(/^[ \t]*([*_-])(?:[ \t]*\1){2,}[ \t]*$/gm, '<hr>')
+
   // Headers
   html = html.replace(/^### (.*$)/gim, '<h3>$1</h3>')
   html = html.replace(/^## (.*$)/gim, '<h2>$1</h2>')
@@ -207,6 +238,7 @@ export function markdownToHtml(markdown: string): string {
   
   // Links
   html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>')
+  html = html.replace(/\u0000LINK(\d+)\u0000/g, (_m, i) => linkUrls[Number(i)])
 
   // Bullet lists: group consecutive "- " or "* " lines into <ul><li>...</li></ul>
   html = html.replace(/(?:^|\n)((?:[-*] .+(?:\n|$))+)/g, (_match, block) => {
@@ -245,6 +277,7 @@ export function markdownToHtml(markdown: string): string {
   html = html.replace(/(<\/[uo]l>)<\/p>/g, '$1')
   html = html.replace(/<br>(<[uo]l>)/g, '$1')
   html = html.replace(/(<\/[uo]l>)<br>/g, '$1')
+  html = html.replace(/<p>(<hr>)<\/p>/g, '$1')
 
   return html
 }
