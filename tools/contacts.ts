@@ -22,7 +22,7 @@
  *   bun contacts.ts stats                     Show contact database stats
  *
  * Examples:
- *   bun contacts.ts lookup "+1-503-929-4312"
+ *   bun contacts.ts lookup "+1-555-555-0123"
  *   echo -e "+15551234567\n+15559876543" | bun contacts.ts lookup-batch
  *   bun contacts.ts export
  *   bun contacts.ts export --output ~/my-contacts.db
@@ -50,9 +50,9 @@ const DEFAULT_DB_PATH = join(dirname(import.meta.dir), 'data/contacts.db')
  * Strips all non-digits, removes leading country code (1) if present.
  *
  * Examples:
- *   "+1-503-929-4312" → "5039294312"
- *   "15039294312"     → "5039294312"
- *   "(503) 929-4312"  → "5039294312"
+ *   "+1-555-555-0123" → "5555550123"
+ *   "15555550123"     → "5555550123"
+ *   "(555) 555-0123"  → "5555550123"
  */
 function normalizePhone(phone: string): string {
   const digits = phone.replace(/\D/g, '')
@@ -408,7 +408,7 @@ Usage:
   bun contacts.ts stats                     Show contact database stats
 
 Examples:
-  bun contacts.ts lookup "+1-503-929-4312"
+  bun contacts.ts lookup "+1-555-555-0123"
   echo -e "+15551234567\\n+15559876543" | bun contacts.ts lookup-batch
   bun contacts.ts export
   bun contacts.ts export --output ~/my-contacts.db

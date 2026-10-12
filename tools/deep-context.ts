@@ -7055,7 +7055,7 @@ async function resolveSlackUserId(userId: string): Promise<string> {
 // Beeper Contact Resolution
 // ============================================================================
 //
-// Problem: Beeper API returns phone numbers (e.g., "+15039294312") as sender
+// Problem: Beeper API returns phone numbers (e.g., "+15555550123") as sender
 // IDs for iMessage/SMS, not contact names. This makes extract-for-summary
 // output hard to read.
 //
@@ -7168,7 +7168,7 @@ async function resolveBeeperContact(chatId: string, phoneOrId: string): Promise<
     return contactName
   }
 
-  // Format phone number nicely (e.g., 15039294312 -> +1 503-929-4312)
+  // Format phone number nicely (e.g., 15555550123 -> +1 555-555-0123)
   const digits = phoneOrId.replace(/\D/g, '')
   let formatted = phoneOrId
   if (digits.length === 11 && digits.startsWith('1')) {
