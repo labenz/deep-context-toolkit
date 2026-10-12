@@ -2,7 +2,7 @@
 
 import { parse_flags, print_help } from './_lib/cli'
 import { fatal, handleError, UsageError, EXIT } from './_lib/errors'
-import { existsSync, mkdirSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 export const name = 'summarize'
@@ -39,19 +39,19 @@ RUN OPTIONS
 
 COMPARE OPTIONS
   --files FILE,FILE,... Comma-separated output files to compare
-  --model MODEL         Model for comparison (default: claude-sonnet-4-5-20250929)
+  --model MODEL         Model for comparison (default: claude-sonnet-5)
   --output FILE         Comparison output file
   --max-tokens NUM      Max output tokens (default: provider default — omit unless needed)
 
 MODELS (auto-detected from name prefix)
-  claude-*              → anthropic.ts (default: claude-sonnet-4-5-20250929)
+  claude-*              → anthropic.ts (default: claude-sonnet-5)
   gpt-*, o3*, o4*       → openai.ts (default: gpt-5)
   gemini-*              → gemini.ts (default: gemini-3-flash)
 
 EXAMPLES
   # Direct mode with 1M context + thinking (Sonnet 4.5)
   summarize run --prompt experiments/v6/prompts/02-narrative-briefing.md \\
-    --export january-2026-v4.md --model claude-sonnet-4-5-20250929 \\
+    --export january-2026-v4.md --model claude-sonnet-5 \\
     --thinking --beta context-1m-2025-08-07
 
   # Direct mode with Gemini (large context)
@@ -60,7 +60,7 @@ EXAMPLES
 
   # Condense mode with Sonnet (split → condense → synthesize)
   summarize run --prompt experiments/v6/prompts/02-narrative-briefing.md \\
-    --export january-2026-v4.md --model claude-sonnet-4-5-20250929 \\
+    --export january-2026-v4.md --model claude-sonnet-5 \\
     --method condense --intermediates-dir experiments/v6/intermediates/
 
   # Compare outputs
@@ -324,7 +324,7 @@ async function cmdRun(argv: string[]) {
   const promptFile = flags.prompt as string
   const exportFile = flags.export as string
   const outputFile = flags.output as string
-  const model = (flags.model as string) || 'claude-sonnet-4-5-20250929'
+  const model = (flags.model as string) || 'claude-sonnet-5'
   const method = (flags.method as string) || 'direct'
   const temperature = parseFloat((flags.temperature as string) || '1.0')
   const thinking = Boolean(flags.thinking)
@@ -501,7 +501,7 @@ async function cmdCompare(argv: string[]) {
 
   const filesStr = flags.files as string
   const outputFile = flags.output as string
-  const model = (flags.model as string) || 'claude-sonnet-4-5-20250929'
+  const model = (flags.model as string) || 'claude-sonnet-5'
   const maxTokens = flags['max-tokens'] ? parseInt(flags['max-tokens'] as string, 10) : undefined
   const temperature = parseFloat((flags.temperature as string) || '1.0')
   const thinking = Boolean(flags.thinking)
@@ -595,9 +595,27 @@ async function cmdListModels() {
   }
 }
 
+// Each run stages its (multi-MB) user message in BASE_DIR/.tmp-*.md and removes it
+// in a `finally`. That covers thrown errors but NOT signals — a killed or timed-out
+// run (SIGTERM/SIGKILL) skips the finally entirely and orphans the file. Sweep stale
+// ones on startup so the leak self-heals instead of growing.
+function sweepStaleTemps(maxAgeHours = 6): void {
+  try {
+    const cutoff = Date.now() - maxAgeHours * 3600_000
+    for (const name of readdirSync(BASE_DIR)) {
+      if (!name.startsWith('.tmp-') || !name.endsWith('.md')) continue
+      const full = join(BASE_DIR, name)
+      try {
+        if (statSync(full).mtimeMs < cutoff) unlinkSync(full)
+      } catch { /* raced with another run — fine */ }
+    }
+  } catch { /* BASE_DIR unreadable — never block the actual work */ }
+}
+
 // --- Main ---
 
 async function main() {
+  sweepStaleTemps()
   const argv = process.argv.slice(2)
   if (argv.length === 0 || argv[0] === '--help' || argv[0] === '-h' || argv[0] === 'help') {
     print_help(name, USAGE)

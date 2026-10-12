@@ -6,17 +6,18 @@
 
 import Database from 'bun:sqlite'
 import { load_env } from './_lib/env'
-import { pick_existing_access_token, try_refresh_token, update_project_env_vars } from './_lib/google_oauth'
+import { pick_existing_access_token, try_refresh_token, update_project_env_vars, resolve_account, account_token_key, ensure_google_token, DEFAULT_ACCOUNT } from './_lib/google_oauth'
 import { join, dirname } from 'path'
 import { convert } from 'html-to-text'
 
 const TOOLS_DIR = import.meta.dir
 const PROJECT_ROOT = dirname(TOOLS_DIR)
-const DB_PATH = join(PROJECT_ROOT, 'data/deep_context/deep_context.db')
+// DEEP_CONTEXT_DB overrides the database location (tests, alternate profiles).
+const DB_PATH = process.env.DEEP_CONTEXT_DB || join(PROJECT_ROOT, 'data/deep_context/deep_context.db')
 
 // Import OWNER_CONFIG from deep-context.ts if available, otherwise use a minimal fallback.
 // When run standalone, reads from the same OWNER_CONFIG block in deep-context.ts.
-let OWNER_CONFIG: { personId: string; displayName: string; emails: string[]; twitterHandle: string; twitterId: string; phone: string; slackIdentifiers: Record<string, { userId: string; searchQuery: string }> }
+let OWNER_CONFIG: { personId: string; displayName: string; emails: string[]; twitterHandle: string; twitterId: string; phone: string; agentEmails?: Record<string, string>; slackIdentifiers: Record<string, { userId: string; searchQuery: string }> }
 try {
   OWNER_CONFIG = (await import('./deep-context')).OWNER_CONFIG
 } catch {
@@ -28,9 +29,24 @@ try {
     twitterHandle: '',
     twitterId: '',
     phone: '',
+    agentEmails: {},
     slackIdentifiers: {},
   }
 }
+
+/**
+ * Which mailbox this run is reading. `resolve_account()` picks it up from
+ * --account/--as in argv or $GOOGLE_ACCOUNT, so it is fixed for the process.
+ *
+ * Each mailbox gets its OWN source value ('gmail', 'gmail-work', …) rather
+ * than a shared one. That matters because the incremental start date is derived
+ * as MAX(threads.last_activity_at) WHERE source = ? minus 7 days: pooling two
+ * mailboxes under 'gmail' would let a busy week in one advance the other's
+ * window and silently skip mail. Separate sources also keep the ID namespaces
+ * apart — the same conversation has different Gmail IDs in each mailbox.
+ */
+const ACCOUNT = resolve_account()
+export const GMAIL_SOURCE = ACCOUNT === DEFAULT_ACCOUNT ? 'gmail' : `gmail-${ACCOUNT}`
 
 // ============================================================
 // TYPE DEFINITIONS
@@ -139,6 +155,34 @@ function parseGmailDate(dateStr: string | undefined, internalDate?: string): str
   }
 
   return new Date().toISOString()
+}
+
+/**
+ * The owner's own addresses — EXACT match against OWNER_CONFIG.emails.
+ *
+ * This used to be a substring match on the address's local part, which folds anyone
+ * whose address merely contains yours (relatives sharing a surname, colleagues with
+ * the same first name, …) into the owner and keeps them out of `people` entirely.
+ * List every address you send from in OWNER_CONFIG.emails.
+ */
+const OWNER_ADDRESSES = new Set(OWNER_CONFIG.emails.map(e => e.toLowerCase().trim()).filter(Boolean))
+
+function isOwnerAddress(email: string): boolean {
+  return OWNER_ADDRESSES.has(email.toLowerCase().trim())
+}
+
+/** Agent sending addresses (OWNER_CONFIG.agentEmails) → their person IDs. */
+const AGENT_ADDRESSES = new Map<string, string>(
+  Object.entries(OWNER_CONFIG.agentEmails ?? {}).map(([email, id]) => [email.toLowerCase().trim(), id])
+)
+
+/**
+ * Pin each agent address to one person ID. An agent's From display name tends to
+ * vary run to run, and createPersonId() keys off it — left alone it would scatter
+ * one agent across several person rows.
+ */
+function personIdForSender(displayName: string | undefined, email: string): string {
+  return AGENT_ADDRESSES.get(email.toLowerCase().trim()) ?? createPersonId(displayName, email)
 }
 
 // Get header value from Gmail message (case-insensitive)
@@ -269,25 +313,45 @@ function stripQuotedContent(text: string): string {
 
 async function getGmailAccessToken(): Promise<string | null> {
   const env = await load_env()
+  const isPeer = ACCOUNT !== DEFAULT_ACCOUNT
 
   // Always try refresh first — access tokens expire after ~1 hour,
   // so the stored token is usually stale (especially for cron jobs).
+  // try_refresh_token resolves the refresh key per-account internally.
   const refreshedToken = await try_refresh_token(env, 'GMAIL')
   if (refreshedToken) {
-    await update_project_env_vars({
-      GOOGLE_TOKEN: refreshedToken,
-      GMAIL_TOKEN: refreshedToken,
-      GDRIVE_TOKEN: refreshedToken,
-      GCAL_TOKEN: refreshedToken,
-    })
+    // Cache under this account's key ONLY. Writing a secondary account's token into
+    // GOOGLE_TOKEN/GMAIL_TOKEN would hand every other tool the wrong mailbox.
+    await update_project_env_vars(
+      isPeer
+        ? { [account_token_key(ACCOUNT)]: refreshedToken }
+        : {
+            GOOGLE_TOKEN: refreshedToken,
+            GMAIL_TOKEN: refreshedToken,
+            GDRIVE_TOKEN: refreshedToken,
+            GCAL_TOKEN: refreshedToken,
+          }
+    )
     return refreshedToken
   }
 
   // Fall back to existing token (might still be valid if recently refreshed)
-  const currentToken = pick_existing_access_token(env, 'GMAIL_TOKEN')
+  const currentToken = pick_existing_access_token(env, isPeer ? account_token_key(ACCOUNT) : 'GMAIL_TOKEN')
   if (currentToken) return currentToken
 
-  console.log('Gmail token expired and could not be refreshed. Re-run extraction to re-authenticate: bun tools/deep-context.ts extract gmail')
+  // Nothing usable stored: when a human is at the terminal, run the Google sign-in flow
+  // (opens a browser; tokens are saved to tools/.env under this account's keys).
+  // Unattended runs (cron) can't complete a browser flow, so they just report it.
+  if (process.stdin.isTTY) {
+    console.log(`No valid Gmail token${isPeer ? ` for account "${ACCOUNT}"` : ''} — starting Google sign-in...`)
+    try {
+      return await ensure_google_token('GMAIL')
+    } catch (e) {
+      console.error(`Google sign-in failed: ${(e as Error).message}`)
+      return null
+    }
+  }
+  console.log('Gmail token missing/expired and could not be refreshed. Run interactively once to sign in: bun tools/deep-context.ts extract gmail' + (isPeer ? ` --account ${ACCOUNT}` : ''))
   return null
 }
 
@@ -375,7 +439,7 @@ async function processGmailThread(
   for (const msg of nonDraftMessages) {
     const from = getGmailHeader(msg.payload.headers, 'From') || ''
     const fromEmail = extractEmailAddr(from)
-    const isFromMe = OWNER_CONFIG.emails.some(e => fromEmail.includes(e.split('@')[0])) || false /* removed: surname check */
+    const isFromMe = isOwnerAddress(fromEmail)
 
     if (isFromMe) {
       myMessageCount++
@@ -392,7 +456,7 @@ async function processGmailThread(
     for (const recipientField of [to, cc]) {
       for (const recipient of recipientField.split(',')) {
         const email = extractEmailAddr(recipient.trim())
-        if (email && !OWNER_CONFIG.emails.some(e => email.includes(e.split('@')[0])) && email.includes('@')) {
+        if (email && !isOwnerAddress(email) && email.includes('@')) {
           const displayName = extractDispName(recipient.trim())
           if (!participantEmails.has(email)) {
             participantEmails.set(email, { displayName, email })
@@ -402,14 +466,14 @@ async function processGmailThread(
     }
   }
 
-  const dbThreadId = `gmail:${thread.id}`
+  const dbThreadId = `${GMAIL_SOURCE}:${thread.id}`
   const threadUrl = `https://mail.google.com/mail/u/0/#inbox/${thread.id}`
   const participantIds: string[] = [ownerId]
 
   if (!dryRun) {
     // Create/update people records for participants
     for (const [email, info] of participantEmails) {
-      const personId = createPersonId(info.displayName, email)
+      const personId = personIdForSender(info.displayName, email)
       if (!personId || personId === ownerId) continue
 
       participantIds.push(personId)
@@ -462,9 +526,10 @@ async function processGmailThread(
     } else {
       db.query(`
         INSERT INTO threads (id, source, source_thread_id, source_url, subject, started_at, last_activity_at, message_count, my_message_count, participant_ids, thread_type)
-        VALUES (?, 'gmail', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         dbThreadId,
+        GMAIL_SOURCE,
         thread.id,
         threadUrl,
         subject,
@@ -480,7 +545,7 @@ async function processGmailThread(
     // Create messages (skip existing ones for updates)
     for (let i = 0; i < nonDraftMessages.length; i++) {
       const msg = nonDraftMessages[i]
-      const messageId = `gmail:${msg.id}`
+      const messageId = `${GMAIL_SOURCE}:${msg.id}`
 
       // For updates, skip messages that already exist
       if (isUpdate) {
@@ -490,8 +555,8 @@ async function processGmailThread(
 
       const from = getGmailHeader(msg.payload.headers, 'From') || ''
       const fromEmail = extractEmailAddr(from)
-      const isFromMe = OWNER_CONFIG.emails.some(e => fromEmail.includes(e.split('@')[0])) || false /* removed: surname check */
-      const senderId = isFromMe ? ownerId : createPersonId(extractDispName(from), fromEmail)
+      const isFromMe = isOwnerAddress(fromEmail)
+      const senderId = isFromMe ? ownerId : personIdForSender(extractDispName(from), fromEmail)
 
       const to = getGmailHeader(msg.payload.headers, 'To') || ''
       const cc = getGmailHeader(msg.payload.headers, 'Cc') || ''
@@ -510,18 +575,36 @@ async function processGmailThread(
         for (let j = i - 1; j >= 0; j--) {
           const prevMsgId = getGmailHeader(nonDraftMessages[j].payload.headers, 'Message-ID')
           if (prevMsgId === inReplyTo) {
-            replyToMessageId = `gmail:${nonDraftMessages[j].id}`
+            replyToMessageId = `${GMAIL_SOURCE}:${nonDraftMessages[j].id}`
             break
           }
         }
       }
 
+      // Authorship, where it can be known deterministically at extraction time.
+      //
+      // Mail from a configured agent address (OWNER_CONFIG.agentEmails) is always that
+      // agent's words. Beyond that, a SENT copy with no Message-ID header was transmitted
+      // through the Gmail API rather than a mail client — meaning an agent or script PUSHED
+      // it, but NOT that an agent WROTE it (you may have had an agent send text you wrote).
+      // That case is recorded as a candidate for review, never as an authorship claim.
+      let authoredBy: string | null = null
+      let authorshipEvidence: string | null = null
+      const agentId = AGENT_ADDRESSES.get(fromEmail)
+      if (agentId) {
+        authoredBy = agentId
+        authorshipEvidence = `agent-address: ${fromEmail}`
+      } else if (isFromMe && !getGmailHeader(msg.payload.headers, 'Message-ID')) {
+        authorshipEvidence = 'api-sent (no Message-ID) — authorship unjudged'
+      }
+
       db.query(`
-        INSERT INTO messages (id, thread_id, source, source_message_id, timestamp, position_in_thread, sender_id, is_from_me, content, content_type, reply_to_message_id, recipients, word_count, raw_json)
-        VALUES (?, ?, 'gmail', ?, ?, ?, ?, ?, ?, 'email', ?, ?, ?, ?)
+        INSERT INTO messages (id, thread_id, source, source_message_id, timestamp, position_in_thread, sender_id, is_from_me, content, content_type, reply_to_message_id, recipients, word_count, raw_json, authored_by, authorship_evidence)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'email', ?, ?, ?, ?, ?, ?)
       `).run(
         messageId,
         dbThreadId,
+        GMAIL_SOURCE,
         msg.id,
         timestamp,
         i + 1,
@@ -541,7 +624,9 @@ async function processGmailThread(
           ),
           snippet: msg.snippet,
           labelIds: msg.labelIds
-        })
+        }),
+        authoredBy,
+        authorshipEvidence
       )
     }
   }
@@ -561,7 +646,7 @@ async function extractGmail(opts: {
   const accessToken = await getGmailAccessToken()
   if (!accessToken) {
     console.error('Error: Gmail authentication required')
-    console.error('Re-run extraction to authenticate (triggers the device auth flow): bun tools/deep-context.ts extract gmail')
+    console.error('Run it once from an interactive terminal to sign in: bun tools/deep-context.ts extract gmail' + (ACCOUNT !== DEFAULT_ACCOUNT ? ` --account ${ACCOUNT}` : ''))
     return { count: 0, newest: null, oldest: null }
   }
 
@@ -628,7 +713,7 @@ async function extractGmail(opts: {
           break
         }
 
-        const dbThreadId = `gmail:${threadStub.id}`
+        const dbThreadId = `${GMAIL_SOURCE}:${threadStub.id}`
         const existing = db.query(`SELECT id, message_count FROM threads WHERE id = ?`).get(dbThreadId) as { id: string; message_count: number } | null
 
         const thread = await gmailGetThread(accessToken, threadStub.id)
@@ -691,10 +776,14 @@ async function extractGmail(opts: {
 }
 
 // ============================================================
-// EXPORTS (for use by deep-context.ts patch-html-emails)
+// EXPORTS (for use by deep-context.ts)
 // ============================================================
 
 export { convertHtmlToText, extractGmail }
+
+// Shared with import-takeout.ts so Takeout rows are byte-for-byte the same shape as API rows
+// (same person IDs, same participant parsing, same quote stripping).
+export { createPersonId, extractEmailAddr, extractDispName, stripQuotedContent, parseGmailDate }
 
 // ============================================================
 // CLI

@@ -24,6 +24,119 @@ export const ALL_GOOGLE_SCOPES = [
   'https://www.googleapis.com/auth/calendar',
 ]
 
+/* ─── Multi-account support ──────────────────────────────────────────────────
+ *
+ * Every Google tool (gmail, gdrive, gcal) talks to ONE account at a time. The
+ * primary account keeps its historical key layout untouched:
+ *
+ *   GOOGLE_TOKEN / GMAIL_TOKEN / GDRIVE_TOKEN / GCAL_TOKEN (+ _REFRESH_TOKEN)
+ *
+ * Secondary accounts are structural peers — same OAuth app, same client
+ * credentials, same ALL_GOOGLE_SCOPES consent — with their own token pair
+ * under a single account-scoped key (no 4-prefix duplication needed for new
+ * accounts):
+ *
+ *   GOOGLE_<ACCOUNT>_TOKEN / GOOGLE_<ACCOUNT>_REFRESH_TOKEN
+ *   GOOGLE_<ACCOUNT>_EMAIL   — the address, used as an OAuth login_hint and
+ *                              to verify the right account was authorized
+ *
+ * Select an account with `--account <name>` (alias `--as`) on any tool, or
+ * with GOOGLE_ACCOUNT=<name> in the environment. Omit it and you get the
+ * primary account, exactly as before.
+ */
+
+export const DEFAULT_ACCOUNT = 'default'
+
+const ACCOUNT_ALIASES = new Set(['default', 'primary', 'main'])
+
+export function normalize_account(name: string | null | undefined): string {
+  const n = String(name ?? '').trim().toLowerCase()
+  if (!n || ACCOUNT_ALIASES.has(n)) return DEFAULT_ACCOUNT
+  if (!/^[a-z0-9][a-z0-9_-]*$/.test(n)) {
+    throw Object.assign(new Error(`Invalid Google account name: ${name}`), { code: 2 })
+  }
+  return n
+}
+
+let forced_account: string | null = null
+
+/** Programmatically pin the account (overrides --account / GOOGLE_ACCOUNT). */
+export function set_google_account(name: string | null | undefined) {
+  forced_account = name === null || name === undefined ? null : normalize_account(name)
+}
+
+function account_from_argv(): string | null {
+  const argv = process.argv.slice(2)
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i] ?? ''
+    if (token === '--account' || token === '--as') {
+      const next = argv[i + 1]
+      if (typeof next === 'string' && !next.startsWith('-')) return next
+    }
+    if (token.startsWith('--account=')) return token.slice('--account='.length)
+    if (token.startsWith('--as=')) return token.slice('--as='.length)
+  }
+  return null
+}
+
+/** The account this process is acting as: --account flag → GOOGLE_ACCOUNT → default. */
+export function resolve_account(): string {
+  if (forced_account) return forced_account
+  const fromArgv = account_from_argv()
+  if (fromArgv) return normalize_account(fromArgv)
+  if (process.env.GOOGLE_ACCOUNT) return normalize_account(process.env.GOOGLE_ACCOUNT)
+  return DEFAULT_ACCOUNT
+}
+
+function account_segment(account: string): string {
+  return account.toUpperCase().replace(/-/g, '_')
+}
+
+export function account_token_key(account: string = resolve_account()): string {
+  return account === DEFAULT_ACCOUNT ? 'GOOGLE_TOKEN' : `GOOGLE_${account_segment(account)}_TOKEN`
+}
+
+export function account_refresh_key(account: string = resolve_account()): string {
+  return account === DEFAULT_ACCOUNT ? 'GOOGLE_REFRESH_TOKEN' : `GOOGLE_${account_segment(account)}_REFRESH_TOKEN`
+}
+
+export function account_email_key(account: string = resolve_account()): string {
+  return account === DEFAULT_ACCOUNT ? 'GOOGLE_EMAIL' : `GOOGLE_${account_segment(account)}_EMAIL`
+}
+
+/** Configured address for an account, if recorded. Lowercased; '' when unknown. */
+export function get_account_email(env: Record<string, string>, account: string = resolve_account()): string {
+  return String(env[account_email_key(account)] ?? '').trim().toLowerCase()
+}
+
+/** All accounts that have credentials in the environment, primary first. */
+export function list_google_accounts(env: Record<string, string>): Array<{ account: string; email: string; authorized: boolean }> {
+  const out: Array<{ account: string; email: string; authorized: boolean }> = [{
+    account: DEFAULT_ACCOUNT,
+    email: get_account_email(env, DEFAULT_ACCOUNT),
+    authorized: Boolean(pick_existing_refresh_token_for(env, DEFAULT_ACCOUNT)),
+  }]
+  const seen = new Set<string>()
+  for (const key of Object.keys(env)) {
+    const m = key.match(/^GOOGLE_([A-Z0-9_]+)_(?:REFRESH_TOKEN|EMAIL)$/)
+    if (!m?.[1]) continue
+    const account = m[1].toLowerCase().replace(/_/g, '-')
+    if (account === 'client' || seen.has(account)) continue
+    seen.add(account)
+    out.push({
+      account,
+      email: get_account_email(env, account),
+      authorized: Boolean(pick_existing_refresh_token_for(env, account)),
+    })
+  }
+  return out
+}
+
+function pick_existing_refresh_token_for(env: Record<string, string>, account: string): string | null {
+  if (account !== DEFAULT_ACCOUNT) return env[account_refresh_key(account)] || null
+  return env.GOOGLE_REFRESH_TOKEN || env.GMAIL_REFRESH_TOKEN || env.GCAL_REFRESH_TOKEN || env.GDRIVE_REFRESH_TOKEN || null
+}
+
 type TokenResponse = {
   access_token?: string
   refresh_token?: string
@@ -129,6 +242,10 @@ export async function get_client_credentials(env: Record<string, string>): Promi
 }
 
 export function pick_existing_access_token(env: Record<string, string>, preferredToken?: string): string | null {
+  const account = resolve_account()
+  // Secondary accounts live in exactly one key — never fall back to the
+  // primary account's token, which would silently read the wrong mailbox.
+  if (account !== DEFAULT_ACCOUNT) return env[account_token_key(account)] || null
   if (preferredToken && env[preferredToken]) {
     return env[preferredToken]
   }
@@ -136,6 +253,8 @@ export function pick_existing_access_token(env: Record<string, string>, preferre
 }
 
 export function pick_existing_refresh_token(env: Record<string, string>, preferredToken?: string): string | null {
+  const account = resolve_account()
+  if (account !== DEFAULT_ACCOUNT) return env[account_refresh_key(account)] || null
   if (preferredToken && env[preferredToken]) {
     return env[preferredToken]
   }
@@ -155,12 +274,7 @@ export async function try_refresh_token(envIn?: Record<string, string>, preferre
     const res = await request<TokenResponse>({ method: 'POST', url: 'https://oauth2.googleapis.com/token', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body, logOnError: false })
     const newToken = res.data?.access_token
     if (typeof newToken === 'string' && newToken.length > 0) {
-      await update_project_env_vars({
-        GOOGLE_TOKEN: newToken,
-        GMAIL_TOKEN: newToken,
-        GDRIVE_TOKEN: newToken,
-        GCAL_TOKEN: newToken
-      })
+      await update_project_env_vars(build_all_token_vars(newToken))
       return newToken
     }
   } catch (_err) {
@@ -293,14 +407,25 @@ export async function start_device_auth(scopes: string[] | undefined, envIn?: Re
 
   // Use 127.0.0.1 with /oauth path - this is what works in real implementations
   const redirectUri = `http://127.0.0.1:${port}/oauth`
-  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&response_type=code&access_type=offline&prompt=consent`
-  
+  const account = resolve_account()
+  const hint = get_account_email(env, account)
+  const hintParam = hint ? `&login_hint=${encodeURIComponent(hint)}` : ''
+  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scope)}&response_type=code&access_type=offline&prompt=consent${hintParam}`
+
   // biome-ignore lint/suspicious/noConsole: CLI tool requires console output
   console.error("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
   // biome-ignore lint/suspicious/noConsole: CLI tool requires console output
   console.error('  Google OAuth Authorization')
   // biome-ignore lint/suspicious/noConsole: CLI tool requires console output
+  console.error(`  Account: ${account}${hint ? ` (${hint})` : ''}`)
+  // biome-ignore lint/suspicious/noConsole: CLI tool requires console output
   console.error('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n')
+  if (account !== DEFAULT_ACCOUNT) {
+    // biome-ignore lint/suspicious/noConsole: CLI tool requires console output
+    console.error(`⚠ Sign in as ${hint || `the "${account}" account`} — picking another account here would`)
+    // biome-ignore lint/suspicious/noConsole: CLI tool requires console output
+    console.error(`  store the wrong credentials under ${account_token_key(account)}.\n`)
+  }
   // biome-ignore lint/suspicious/noConsole: CLI tool requires console output
   console.error('Opening browser for authorization...')
   // biome-ignore lint/suspicious/noConsole: CLI tool requires console output
@@ -378,8 +503,18 @@ export async function start_device_auth(scopes: string[] | undefined, envIn?: Re
   throw new Error('Token exchange failed: no access token received')
 }
 
-/** Save access + refresh tokens to ALL Google token keys at once. */
+/**
+ * Save access + refresh tokens for the active account.
+ * Primary account writes all 4 legacy key prefixes; secondary accounts write
+ * their single GOOGLE_<ACCOUNT>_* pair.
+ */
 export function build_all_token_vars(access: string, refresh?: string): Record<string, string> {
+  const account = resolve_account()
+  if (account !== DEFAULT_ACCOUNT) {
+    const vars: Record<string, string> = { [account_token_key(account)]: access }
+    if (refresh) vars[account_refresh_key(account)] = refresh
+    return vars
+  }
   const vars: Record<string, string> = {
     GOOGLE_TOKEN: access,
     GMAIL_TOKEN: access,
@@ -404,18 +539,53 @@ export function build_all_token_vars(access: string, refresh?: string): Record<s
  */
 export async function ensure_google_token(preferredKey = 'GOOGLE'): Promise<string> {
   const env = await load_env()
-  const existing = pick_existing_access_token(env, `${preferredKey}_TOKEN`)
-  if (existing) return existing
 
+  // Prefer a freshly-refreshed token: refresh → persist → use. Returning a stored
+  // access token blindly causes 401s once it expires (~1h), because callers don't
+  // retry on auth failure. try_refresh_token persists the new token and returns
+  // null when there's no/invalid refresh token, so we fall back to the existing
+  // access token, then to device auth.
   const refreshed = await try_refresh_token(env, preferredKey)
   if (refreshed) return refreshed
+
+  const existing = pick_existing_access_token(env, `${preferredKey}_TOKEN`)
+  if (existing) return existing
 
   const auth = await start_device_auth(ALL_GOOGLE_SCOPES, env)
   if (!auth?.access_token) {
     throw Object.assign(new Error('Google OAuth failed'), { code: 64 })
   }
-  await update_project_env_vars(build_all_token_vars(auth.access_token, auth.refresh_token))
+  const account = resolve_account()
+  const expected = get_account_email(env, account)
+  const vars = build_all_token_vars(auth.access_token, auth.refresh_token)
+  if (expected || account !== DEFAULT_ACCOUNT) {
+    // Guard the account chooser: storing another mailbox's credentials under
+    // this account's key would silently read/write the wrong account later.
+    const actual = await fetch_authorized_email(auth.access_token)
+    if (expected && actual && actual !== expected) {
+      throw Object.assign(
+        new Error(`Authorized ${actual}, but account "${account}" is ${expected} — tokens not saved. Re-run and choose ${expected}.`),
+        { code: 64 },
+      )
+    }
+    if (actual && !expected) vars[account_email_key(account)] = actual
+  }
+  await update_project_env_vars(vars)
   return auth.access_token
+}
+
+/** Address of the account a token belongs to (''  when it can't be determined). */
+export async function fetch_authorized_email(access_token: string): Promise<string> {
+  try {
+    const res = await request<{ emailAddress?: string }>({
+      url: 'https://gmail.googleapis.com/gmail/v1/users/me/profile',
+      headers: { Authorization: `Bearer ${access_token}` },
+      logOnError: false,
+    })
+    return String(res.data?.emailAddress ?? '').trim().toLowerCase()
+  } catch {
+    return ''
+  }
 }
 
 /** @deprecated Use ensure_google_token('GCAL') instead */

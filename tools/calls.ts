@@ -94,10 +94,10 @@ EXAMPLES:
   calls missing summary_file --limit 20
 
   # Update tags for a call
-  calls update "01KFVCXF" --set tags="ai-safety,formal-verification,podcast-prep"
+  calls update "01JAAAAA" --set tags="project-x,follow-up"
 
   # Generate summary for a call
-  calls summarize "01KFVCXF"
+  calls summarize "01JAAAAA"
 
   # Batch summarize recent calls
   calls batch-summarize --limit 5 --from 2026-01-01

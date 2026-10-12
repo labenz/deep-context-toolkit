@@ -30,15 +30,18 @@ COMMANDS:
     Anthropic API directly. For normal Claude tasks, use Claude Code
     sub-agents instead (Task tool with subagent_type).
 
-MODELS (current):
-    claude-opus-4-8           Flagship, most capable (1M in, 128K out)
-    claude-opus-4-7           Previous gen Opus (1M in, 128K out)
-    claude-sonnet-4-6         Fast + very capable (1M in, 128K out)
-    claude-sonnet-4-5-20250929  Previous gen Sonnet (200K in, 64K out)
-    claude-haiku-4-5-20251001   Fastest, great value (200K in, 8K out)
+MODELS (current as of 2026-09-22):
+    claude-opus-5-5           Default workhorse + daily driver, $4/$20, cache reads $0.20 (1M in, 128K out)
+    claude-opus-5             Superseded by 5.5 ($5/$25)
+    claude-fable-5-1          Escalation tier, $10/$50 (avoid for batch — cost;
+                              no forced tool_choice: "any"/"tool" → 400)
+    claude-fable-5            Superseded by 5.1 (same price, 4× cache-read cost)
+    claude-sonnet-5           Fast + very capable
+    claude-opus-4-8           Previous gen Opus (1M in, 128K out)
+    claude-haiku-4-5-20251001 Fastest, great value (200K in, 8K out)
 
 CHAT OPTIONS:
-    -m, --model MODEL       Model (default: claude-sonnet-4-5-20250929)
+    -m, --model MODEL       Model (default: claude-sonnet-5)
     -s, --system TEXT        System prompt
     -t, --temperature NUM    Temperature 0.0-1.0 (default: 1.0)
     --max-tokens NUM         Max output tokens (omit to use model max)
@@ -63,7 +66,7 @@ BATCH STATUS/RESULTS:
     --batch-id ID            Batch ID to check/retrieve
 
 COUNT OPTIONS:
-    -m, --model MODEL        Model for counting (default: claude-sonnet-4-5-20250929)
+    -m, --model MODEL        Model for counting (default: claude-sonnet-5)
     -s, --system TEXT         System prompt to include in count
 
 GENERAL:
@@ -73,7 +76,7 @@ GENERAL:
 EXAMPLES:
     # Basic chat
     anthropic "Summarize this text"
-    anthropic -m claude-opus-4-7 "Analyze this complex problem"
+    anthropic -m claude-opus-5-5 "Analyze this complex problem"
 
     # With system prompt
     anthropic -s "You are a JSON extractor" "Extract entities from: ..."
@@ -199,10 +202,22 @@ async function buildContentBlocks(
 }
 
 function usesAdaptiveThinking(model: string): boolean {
-  // Models that use adaptive thinking API (type: 'adaptive') instead of manual (type: 'enabled')
-  // 4.6+ models: Opus 4.7/4.8, Sonnet 4.6, etc. Match any 4.6+ minor (4-6..4-9, 4.6..4.9)
-  // so new releases don't silently fall back to manual thinking / lose --effort.
-  return /4[-.]([6-9])\b/.test(model)
+  // Models that use the adaptive thinking API (type: 'adaptive' + output_config.effort)
+  // instead of manual budgeted thinking (type: 'enabled').
+  //
+  // Adaptive landed in the 4.6 generation and is the ONLY supported mode for the
+  // Claude 5 family — sending `thinking: {type: 'enabled'}` to Opus 5 / Sonnet 5 /
+  // Fable 5 is a hard 400 ("thinking.type.enabled is not supported for this model").
+  // The old regex only matched 4.6-4.9, so every Claude 5 model silently fell back
+  // to manual thinking and every --thinking call failed (broke the monthly-summary
+  // pipeline; found 2026-08-15). Parse major/minor instead of pattern-matching so
+  // Claude 6+ keeps working without another edit.
+  const m = /claude-[a-z]+-(\d+)(?:-(\d+))?/.exec(model)
+  if (!m) return false
+  const major = parseInt(m[1], 10)
+  const minor = m[2] ? parseInt(m[2], 10) : 0
+  if (major >= 5) return true
+  return major === 4 && minor >= 6
 }
 
 function modelMaxOutputTokens(model: string): number {
@@ -405,7 +420,7 @@ async function createBatch(
     throw new UsageError('Requests file must be a non-empty JSON array')
   }
 
-  const model = options.model || 'claude-sonnet-4-5-20250929'
+  const model = options.model || 'claude-sonnet-5'
 
   // Build batch requests
   const requests = items.map((item) => ({
@@ -594,7 +609,7 @@ async function main() {
   }
 
   const model = String(flags.model || '')
-  const resolvedModel = model || 'claude-sonnet-4-5-20250929'
+  const resolvedModel = model || 'claude-sonnet-5'
   const temperature = flags.temperature ? parseFloat(String(flags.temperature)) : undefined
   const explicitMaxTokens = flags['max-tokens'] ? parseInt(String(flags['max-tokens']), 10) : undefined
   let maxTokens = explicitMaxTokens ?? modelMaxOutputTokens(resolvedModel)
@@ -650,7 +665,7 @@ async function main() {
 
       let result: string
       if (stream) {
-        result = await streamChat(apiKey, model || 'claude-sonnet-4-5-20250929', messages, {
+        result = await streamChat(apiKey, model || 'claude-sonnet-5', messages, {
           system: systemPrompt,
           temperature,
           maxTokens,
@@ -659,7 +674,7 @@ async function main() {
           effort,
         })
       } else {
-        result = await chatNonStreaming(apiKey, model || 'claude-sonnet-4-5-20250929', messages, {
+        result = await chatNonStreaming(apiKey, model || 'claude-sonnet-5', messages, {
           system: systemPrompt,
           temperature,
           maxTokens,
@@ -704,7 +719,7 @@ async function main() {
       if (!input) throw new UsageError('No text provided for token counting')
       await countTokens(
         apiKey,
-        model || 'claude-sonnet-4-5-20250929',
+        model || 'claude-sonnet-5',
         input,
         flags.system ? String(flags.system) : undefined
       )

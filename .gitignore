@@ -11,6 +11,7 @@ data/contacts.db
 # Config files (created from templates)
 data/deep_context/config.json
 data/deep_context/beeper-config.json
+tools/beeper-config.json
 tools/slack-capture-config.json
 
 # Your generated data — keep private, never commit
@@ -28,3 +29,14 @@ tools/node_modules/
 .DS_Store
 *.swp
 *~
+
+# Semantic-search sidecars, public export, debug artifacts
+data/deep_context/*.db
+data/deep_context/*.db-shm
+data/deep_context/*.db-wal
+data/deep_context/*.db.building
+data/deep_context/debug/
+logs/
+
+# Google Takeout import staging (parsed mail — private)
+data/deep_context/takeout/

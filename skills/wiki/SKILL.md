@@ -202,7 +202,7 @@ Generate or regenerate a specific entity's articles.
 1. Look up entity in `_entity-registry.json` to find the slug and category
 2. Search monthly and annual summaries for mentions
 3. Check `corrections.json` for relevant corrections
-4. Look up contact info in `contact-lookup.json` and `tools/deep-context.ts contacts search "<name>"`
+4. Look up contact info in `contact-lookup.json` (and `tools/deep-context.ts query "<name>" --limit 20` for recent context)
 5. Generate private article (full detail, source pointers, private notes, ALL contact modes)
 6. Derive shared article (strip sensitive content; keep contact info except `notes` and `signal`)
 7. Rebuild indexes
@@ -214,7 +214,7 @@ Re-run contact enrichment for specific articles or all people.
 **Flow:**
 
 1. If no argument: process all `people/` articles. If slug: process one. If category: process all in category.
-2. Rebuild `contact-lookup.json` from the deep-context DB people table + unified_contacts + macOS Contacts:
+2. Rebuild `contact-lookup.json` from the deep-context DB `people` table + macOS Contacts:
    ```bash
    ~/.bun/bin/bun tools/contacts.ts export  # refresh macOS contacts
    ```
@@ -270,4 +270,4 @@ ALL sub-agents generating or updating articles:
    ```
    Always update the date in this block when modifying WHN content.
 
-8. **Comprehensive contact info:** Every person article must have a fully populated `contact:` YAML block. Check `contact-lookup.json` for emails, Slack IDs, Twitter handles, and phones. Search the deep-context DB (`tools/deep-context.ts contacts search "<name>"`) for additional data. Extract contact info mentioned in source summaries. Private articles get ALL fields; shared articles omit `notes` and `signal`.
+8. **Comprehensive contact info:** Every person article must have a fully populated `contact:` YAML block. Check `contact-lookup.json` for emails, Slack IDs, Twitter handles, and phones. Search the deep-context DB (`tools/deep-context.ts query "<name>"`, or `SELECT identifiers FROM people WHERE display_name LIKE ...`) for additional data. Extract contact info mentioned in source summaries. Private articles get ALL fields; shared articles omit `notes` and `signal`.
