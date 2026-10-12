@@ -46,7 +46,7 @@ Every run checks ALL 7 default sources unless narrowed by named sources or `--ex
 
 | # | Source | Command | Prerequisites |
 |---|--------|---------|---------------|
-| 1 | gmail | `deep-context extract gmail` | Google OAuth configured |
+| 1 | gmail | `deep-context extract gmail` | Google OAuth configured (no OAuth? see **No-OAuth path: Google Takeout** below; skip gmail in routine runs) |
 | 2 | slack | `deep-context extract slack` | Slack token(s) configured |
 | 3 | slack-dm | `deep-context extract slack-dm` | Slack token(s) configured |
 | 4 | beeper | `deep-context extract beeper` | Desktop running, contacts fresh |
@@ -67,6 +67,32 @@ Every run checks ALL 7 default sources unless narrowed by named sources or `--ex
   `source='gmail-<name>'` with its own incremental watermark, so it never shifts the primary
   mailbox's start date. Authorize once with `extract gmail --account <name>` (device flow;
   sign in as that account), then add it to your routine if you want it every run.
+- **takeout** — one-shot history import from a Google Takeout export (see next section). Not a
+  routine source: run it when the user hands you a new Takeout archive.
+
+### No-OAuth path: Google Takeout
+
+For users who haven't set up Google OAuth (or don't want to), import Gmail **and Google Calendar** from
+a Takeout export. It needs no tokens and no Google Cloud project.
+
+1. **Get the export.** If the user has none, walk them through README → "Start without OAuth: Google Takeout":
+   takeout.google.com → **Deselect all** → tick **Mail** (MBOX) and **Calendar** (iCalendar) → Next step →
+   *Send download link via email*, *Export once*, *.zip*, largest file size → **Create export**. Google
+   emails a download link, usually within hours (large mailboxes can take a day or more). The links
+   expire after about a week.
+2. **Seed pass (fast orientation):**
+   `~/.bun/bin/bun tools/deep-context.ts import-takeout <takeout-*.zip> --since <today minus 30 days>`
+   The first run scans the whole mbox into a staging DB, then loads only recently active threads. It
+   prints your detected addresses; copy them into `OWNER_CONFIG.emails` if they aren't there yet.
+3. **Full-history pass:** the same command without `--since`. It reuses the staging DB (no re-scan), loads
+   newest-first, and is resumable. If it's interrupted (laptop sleep, Ctrl-C), re-run the same command.
+4. **Afterwards:** `status`, `recent --hours 720`, `query <term> --source calendar`. Then run enrich/embeddings
+   as usual. If OAuth is added later, `extract gmail` lines up with the imported rows (same `gmail:<hex id>`
+   IDs) and only fetches what's new.
+
+Options worth knowing: `--account work` (second mailbox → `gmail-work`), `--me addr` (extra owner address),
+`--mail-only` / `--calendar-only`, `--dry-run` (counts only), `--rescan` (ignore scan checkpoint).
+Long imports should run detached or in a sub-agent; they print progress every ~5s.
 
 ---
 

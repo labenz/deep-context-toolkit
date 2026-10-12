@@ -17,6 +17,7 @@ All tools are Bun/TypeScript. Run with `bun tools/<tool>.ts` or `~/.bun/bin/bun 
 | Dropped balls | `bun tools/dropped-balls.ts` | Email threads awaiting your reply (last message inbound) |
 | Cron wrapper | `tools/deep-context-cron.sh` | Scheduled refresh run by your Claude Code / Codex subscription |
 | Gmail Extractor | `bun tools/gmail-extractor.ts` | Gmail extraction logic (called by deep-context); outbound + inbound-from-known passes |
+| Takeout Importer | `bun tools/deep-context.ts import-takeout <zip>` | **No-OAuth path**: Gmail mbox + Calendar .ics from a Google Takeout export (`tools/import-takeout.ts`; tests in `tools/tests/`) |
 | Slack | `bun tools/slack.ts` | Slack API client (channels, DMs, search) |
 | Twitter | `bun tools/twitter-api.ts` | Official X API v2 client (user-tweets/liked-tweets/post/dm/etc.); live tweet fetch for extraction |
 | Beeper | `bun tools/beeper.ts` | Beeper Desktop API (iMessage, WhatsApp, Signal) |
@@ -48,6 +49,7 @@ All tools are Bun/TypeScript. Run with `bun tools/<tool>.ts` or `~/.bun/bin/bun 
 | `message_metadata` | AI-enriched metadata (quality, topics, sentiment, originality, etc.) |
 | `syntheses` | Generated summaries (timelines, relationships, projects) |
 | `todo_items` | Action items auto-detected from messages |
+| `calendar_events` | Google Calendar events from a Takeout `.ics` import (`query <term> --source calendar`) |
 | `unified_contacts` | Deduplicated contact records |
 | `contact_links` | Maps `people` records to `unified_contacts` |
 | `extraction_log` | Tracks when each source was last extracted |
@@ -104,6 +106,7 @@ All secrets live in `tools/.env`. The env loader (`_lib/env.ts`) searches multip
 - **Gmail — two passes:** Pass 1 = owner's sent mail (`from:me`); Pass 2 = inbound mail from *known contacts* (`buildContactInboundQuery()` derives the contact list from existing threads where the owner participated). Threads with `my_message_count = 0` now get stored.
 - **Slack — three passes inside `extract slack`:** Pass 1 = owner's messages (`from:`); Pass 2 = threads where the owner is @-mentioned (`extractSlackMentions`, driven by `mentionQueries`); Pass 3 = full capture of channels/users in `tools/slack-capture-config.json` (`extractSlackChannelFull` via `loadSlackCaptureConfig`).
 - **GroupMe** is token-only (`GROUPME_ACCESS_TOKEN`); first run should pass `--backfill`.
+- **Google Takeout (no OAuth):** `import-takeout <takeout.zip|folder> [--since DATE] [--account NAME]` applies the same two-pass policy to a Takeout mbox, streaming it into a staging DB (`data/deep_context/takeout/`, checkpointed by byte offset), then loading newest threads first. Takeout's decimal Gmail ids (mbox `From ` line, `X-GM-THRID`) are converted to the API's hex ids, so rows are `gmail:<hex>` exactly as `extract gmail` writes them; a later API run extends rather than duplicates. Re-runs are idempotent. Run `bun test tools/tests/` after changing it.
 - **Multiple Google accounts:** `extract gmail --account <name>` reads a secondary mailbox into `source='gmail-<name>'` (own watermark, own tokens `GOOGLE_<NAME>_TOKEN/_REFRESH_TOKEN/_EMAIL`). The first interactive run opens the Google sign-in flow; verify you pick the right account.
 - **Phone numbers** in Beeper/iMessage thread titles are resolved to contact names at print time when `data/contacts.db` exists (`bun tools/contacts.ts export`, macOS) — stored data is not rewritten.
 
@@ -178,7 +181,7 @@ If the user asks to set up or configure the toolkit:
 
 1. **Read `OWNER_CONFIG`** at the top of `tools/deep-context.ts` and help them fill in their identity info (person ID, display name, emails, Twitter handle, Slack user IDs)
 2. **Create `tools/.env`** -- walk through each source they want to use and help them add the required API keys
-3. **Google OAuth** -- guide them through creating a Google Cloud project, enabling Gmail API, creating OAuth credentials, and running the device auth flow
+3. **Google OAuth** -- guide them through creating a Google Cloud project, enabling Gmail API, creating OAuth credentials, and running the device auth flow. **Or skip it for now:** walk them through a Google Takeout export (README → "Start without OAuth: Google Takeout") and run `import-takeout` — seed with `--since <30 days ago>` first, then the full history
 4. **Slack** -- help them create a Slack app with the required scopes and install it to their workspace(s)
 5. **Copy config templates** -- `config.template.json` to `config.json`, `beeper-config.template.json` to `beeper-config.json`, and (if using Slack full-capture) `tools/slack-capture-config.template.json` to `tools/slack-capture-config.json`
 6. **Run `deep-context init`** to create the database

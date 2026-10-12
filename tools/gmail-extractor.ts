@@ -12,7 +12,8 @@ import { convert } from 'html-to-text'
 
 const TOOLS_DIR = import.meta.dir
 const PROJECT_ROOT = dirname(TOOLS_DIR)
-const DB_PATH = join(PROJECT_ROOT, 'data/deep_context/deep_context.db')
+// DEEP_CONTEXT_DB overrides the database location (tests, alternate profiles).
+const DB_PATH = process.env.DEEP_CONTEXT_DB || join(PROJECT_ROOT, 'data/deep_context/deep_context.db')
 
 // Import OWNER_CONFIG from deep-context.ts if available, otherwise use a minimal fallback.
 // When run standalone, reads from the same OWNER_CONFIG block in deep-context.ts.
@@ -779,6 +780,10 @@ async function extractGmail(opts: {
 // ============================================================
 
 export { convertHtmlToText, extractGmail }
+
+// Shared with import-takeout.ts so Takeout rows are byte-for-byte the same shape as API rows
+// (same person IDs, same participant parsing, same quote stripping).
+export { createPersonId, extractEmailAddr, extractDispName, stripQuotedContent, parseGmailDate }
 
 // ============================================================
 // CLI

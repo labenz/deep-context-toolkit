@@ -25,6 +25,7 @@ import {
 import { evaluateWithLLM, batchEvaluateWithLLM, type LLMMatchResult } from './_lib/contact-llm'
 import EmailReplyParser from 'email-reply-parser'
 import { convertHtmlToText, extractGmail as extractGmailRaw, GMAIL_SOURCE } from './gmail-extractor'
+import { CALENDAR_SCHEMA } from './_lib/calendar-schema'
 import {
   openVectorDb,
   chunkThread,
@@ -78,6 +79,12 @@ USAGE:
   deep-context extract <source> [--from DATE] [--to DATE] [--limit N] [--dry-run] [--backfill]
     Sources: gmail, slack, slack-mentions, slack-channel-full, slack-dm, beeper, groupme, twitter, twitter-live, calls, podcast
 
+  # Import a Google Takeout export (Gmail mbox + Calendar .ics) — no Google Cloud / OAuth setup
+  deep-context import-takeout <takeout.zip|folder|file.mbox|file.ics> [--since DATE] [--account NAME]
+                              [--me EMAIL] [--mail-only|--calendar-only] [--dry-run] [--rescan]
+    Resumable and idempotent; a later 'extract gmail' won't duplicate what it imported.
+    Full help: bun tools/import-takeout.ts --help
+
   # Run metadata enrichment on unprocessed messages
   deep-context enrich [--limit N] [--source SOURCE] [--extracted-since DATE] [--dry-run]
 
@@ -87,6 +94,8 @@ USAGE:
 
   # Search the database (keyword LIKE search by default — no API key needed)
   deep-context query <search_term> [--source SOURCE] [--from DATE] [--to DATE] [--limit N]
+    --source calendar searches calendar events (title, description, location, attendees);
+    use '%' as the term to list events in a --from/--to window.
     --semantic   Vector search over embedded conversation chunks (meaning, not keywords)
     --hybrid     Combine keyword + semantic results (reranked together; RRF by thread if rerank off)
     --no-rerank  Skip the optional Voyage rerank-3 pass (used automatically for --semantic/--hybrid
@@ -220,7 +229,8 @@ EXAMPLES:
 // Paths
 const PROJECT_ROOT = dirname(import.meta.dir)
 const DATA_DIR = join(PROJECT_ROOT, 'data/deep_context')
-const DB_PATH = join(DATA_DIR, 'deep_context.db')
+// DEEP_CONTEXT_DB overrides the database location (tests, alternate profiles).
+const DB_PATH = process.env.DEEP_CONTEXT_DB || join(DATA_DIR, 'deep_context.db')
 // Semantic-search sidecar. One file per embedding provider — vector spaces from different
 // models are incompatible. Override with DEEP_CONTEXT_VECTOR_DB.
 // Resolved lazily so DEEP_CONTEXT_* settings in tools/.env (applied in main()) take effect.
@@ -321,6 +331,12 @@ function getDb(): Database {
   }
   if (msgCols.size > 0 && !msgCols.has('authorship_evidence')) {
     db.exec(`ALTER TABLE messages ADD COLUMN authorship_evidence TEXT`)
+  }
+
+  // Migrate: calendar_events (additive; filled by import-takeout from Calendar .ics files)
+  const hasCalendar = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='calendar_events'").get()
+  if (!hasCalendar) {
+    db.exec(CALENDAR_SCHEMA)
   }
 
   return db
@@ -489,6 +505,7 @@ async function cmdStatus(args: ParsedArgs): Promise<void> {
   `).all() as { source: string; total: number; my_messages: number }[]
 
   const peopleCounts = db.query(`SELECT COUNT(*) as count FROM people`).get() as { count: number }
+  const calendarCount = db.query(`SELECT COUNT(*) as count, MIN(start_at) as first, MAX(start_at) as last FROM calendar_events`).get() as { count: number; first: string | null; last: string | null }
 
   const enrichedCount = db.query(`SELECT COUNT(*) as count FROM message_metadata`).get() as { count: number }
   const totalMyMessages = db.query(`SELECT COUNT(*) as count FROM messages WHERE is_from_me = 1`).get() as { count: number }
@@ -517,6 +534,7 @@ async function cmdStatus(args: ParsedArgs): Promise<void> {
       threads: threadCounts,
       messages: messageCounts,
       people: peopleCounts.count,
+      calendar_events: calendarCount.count,
       enrichment: {
         enriched: enrichedCount.count,
         total_my_messages: totalMyMessages.count,
@@ -569,6 +587,9 @@ async function cmdStatus(args: ParsedArgs): Promise<void> {
   console.log(`${'TOTAL'.padEnd(12)} ${formatNumber(totalThreads).padStart(10)} ${formatNumber(totalMessages).padStart(12)} ${formatNumber(totalMy).padStart(14)}`)
 
   console.log(`\nPeople in database: ${formatNumber(peopleCounts.count)}`)
+  if (calendarCount.count > 0) {
+    console.log(`Calendar events: ${formatNumber(calendarCount.count)} (${(calendarCount.first || '').slice(0, 10)} → ${(calendarCount.last || '').slice(0, 10)})`)
+  }
 
   // Enrichment Progress
   console.log('\n\nENRICHMENT PROGRESS')
@@ -6568,6 +6589,11 @@ async function cmdQuery(args: ParsedArgs): Promise<void> {
   const toDate = args.flags.to as string | undefined
   const limit = (args.flags.limit as number) || 20
 
+  if (sourceFilter === 'calendar') {
+    queryCalendar(searchTerm, { fromDate, toDate, limit })
+    return
+  }
+
   const db = getDb()
 
   let query = `
@@ -6607,6 +6633,38 @@ async function cmdQuery(args: ParsedArgs): Promise<void> {
     if (context) console.log(`  ${context}`)
     const preview = r.content.substring(0, 200).replace(/\n/g, ' ')
     console.log(`  ${preview}${r.content.length > 200 ? '...' : ''}`)
+    console.log()
+  }
+}
+
+/** Calendar events (from import-takeout) — keyword search over title/description/location/attendees. */
+function queryCalendar(term: string, opts: { fromDate?: string; toDate?: string; limit: number }): void {
+  const db = getDb()
+  let sql = `
+    SELECT summary, description, location, start_at, end_at, all_day, rrule, status, organizer,
+           attendees, my_response, calendar_name, conference_url
+    FROM calendar_events
+    WHERE (summary LIKE ?1 OR description LIKE ?1 OR location LIKE ?1 OR attendees LIKE ?1)`
+  const params: any[] = [`%${term}%`]
+  if (opts.fromDate) { sql += ` AND start_at >= ?${params.length + 1}`; params.push(opts.fromDate) }
+  if (opts.toDate) { sql += ` AND start_at <= ?${params.length + 1}`; params.push(opts.toDate) }
+  sql += ` ORDER BY start_at DESC LIMIT ?${params.length + 1}`
+  params.push(opts.limit)
+  const rows = db.query(sql).all(...params) as any[]
+  db.close()
+  console.log(`Found ${rows.length} calendar events matching "${term}":\n`)
+  for (const r of rows) {
+    const when = r.all_day ? `${r.start_at} (all day)` : `${r.start_at}${r.end_at ? ` → ${r.end_at}` : ''}`
+    const flags = [r.rrule ? 'recurring' : '', r.status && r.status !== 'CONFIRMED' ? r.status.toLowerCase() : '', r.my_response ? `you: ${r.my_response.toLowerCase()}` : ''].filter(Boolean).join(', ')
+    console.log(`[calendar] ${when}${flags ? `  (${flags})` : ''}`)
+    console.log(`  ${r.summary || '(no title)'}${r.location ? ` @ ${r.location}` : ''}`)
+    let who: string[] = []
+    try { who = (JSON.parse(r.attendees || '[]') as Array<{ email: string; name: string | null }>).map(a => a.name || a.email) } catch {}
+    if (who.length) console.log(`  With: ${who.slice(0, 12).join(', ')}${who.length > 12 ? ` +${who.length - 12}` : ''}`)
+    if (r.description) {
+      const d = String(r.description).replace(/\s+/g, ' ').trim()
+      console.log(`  ${d.substring(0, 200)}${d.length > 200 ? '...' : ''}`)
+    }
     console.log()
   }
 }
@@ -11768,6 +11826,14 @@ async function main(): Promise<void> {
       if (/^(DEEP_CONTEXT_|OLLAMA_)/.test(k) && v && !process.env[k]) process.env[k] = v
     }
   } catch { /* no .env yet — fine */ }
+
+  // import-takeout has its own flags (--me, --rescan, --mail-only, …): route it before the
+  // shared flag parser would reject them.
+  if (process.argv[2] === 'import-takeout') {
+    const { main: importTakeoutMain } = await import('./import-takeout')
+    await importTakeoutMain(process.argv.slice(3))
+    return
+  }
 
   const schema = {
     help: { type: 'boolean' as const, alias: 'h' },

@@ -22,6 +22,12 @@ deep-context query "search term" --source gmail --from 2026-01-01 --to 2026-03-0
 ```
 Sources: `gmail` (plus `gmail-<account>` for secondary mailboxes), `slack`, `slack-dm`, `beeper`, `groupme`, `twitter`, `calls`, `podcast`
 
+Calendar events (from a Google Takeout import) live in their own table — search them with `--source calendar`:
+```bash
+deep-context query "offsite" --source calendar
+deep-context query '%' --source calendar --from 2026-10-12 --to 2026-10-19   # everything in a window
+```
+
 ### Semantic search (optional — finds paraphrases keyword search misses)
 ```bash
 deep-context query "someone had to reschedule" --semantic --limit 10   # meaning-based
@@ -70,6 +76,7 @@ deep-context extract slack-dm
 deep-context extract beeper --backfill
 deep-context extract twitter          # Archive import + live fetch
 deep-context extract twitter-live     # Recent via the official X API
+deep-context import-takeout takeout.zip --since 2026-09-12   # No-OAuth: Gmail mbox + Calendar .ics from Google Takeout
 ```
 
 ### Enrich messages with AI metadata (optional — needs GEMINI_API_KEY)
@@ -147,6 +154,7 @@ deep-context dedup-beeper-imessage [--dry-run]
 | `syntheses` | Generated summaries |
 | `unified_contacts` / `contact_links` | Deduplicated contacts and their links to `people` |
 | `extraction_log` | Extraction runs per source |
+| `calendar_events` | Calendar events from Takeout `.ics` (start_at UTC or YYYY-MM-DD for all-day; attendees JSON; `my_response`; rrule not expanded) |
 
 **Thread ID format:** `source:thread_id` (e.g. `gmail:18d3a4b5c6d7e8f9`)
 
